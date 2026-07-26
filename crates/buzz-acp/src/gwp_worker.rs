@@ -24,6 +24,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use nostr::ToBech32;
+
 use crate::config::Config;
 use crate::pool::{self, OwnedAgent, PromptContext, PromptOutcome, PromptResult};
 use crate::relay::{RestClient, relay_ws_to_http};
@@ -104,12 +106,29 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         gateway_executor: None,
     });
 
+    // The gateway spawns this worker with a cleared environment, but the
+    // agent's own tooling (the `buzz` CLI it shells out to for replies)
+    // authenticates with the agent key and relay URL. Inject both into the
+    // agent child exactly as the harness does for MCP children — the key
+    // reaches this process via --private-key-file, never the environment or
+    // the gateway's journaled route config.
+    let mut agent_env = config.persona_env_vars.clone();
+    agent_env.push(("BUZZ_RELAY_URL".into(), config.relay_url.clone()));
+    agent_env.push((
+        "BUZZ_PRIVATE_KEY".into(),
+        config
+            .keys
+            .secret_key()
+            .to_bech32()
+            .expect("secret key bech32 encoding should never fail"),
+    ));
+
     let startup = PoolStartup {
         // One worker, one agent — parallelism is the gateway's job now.
         agents: 1,
         command: config.agent_command.clone(),
         args: config.agent_args.clone(),
-        extra_env: config.persona_env_vars.clone(),
+        extra_env: agent_env,
         has_generated_codex_config: config.has_generated_codex_config,
         model: config.model.clone(),
         observer: None,
