@@ -155,7 +155,10 @@ fn a_turn_runs_end_to_end_through_the_gwp_worker() {
     });
     writeln!(stdin, "{turn3}").unwrap();
     let result3 = read_frame(&mut reader);
-    assert_eq!(result3["type"], "result", "worker must survive a bad payload: {result3}");
+    assert_eq!(
+        result3["type"], "result",
+        "worker must survive a bad payload: {result3}"
+    );
     assert_eq!(result3["turn_id"], "turn-3");
 
     drop(stdin); // EOF -> clean worker shutdown

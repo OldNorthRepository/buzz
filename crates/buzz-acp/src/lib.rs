@@ -2532,12 +2532,9 @@ async fn tokio_main() -> Result<()> {
     // arrive on `gateway_done_rx`.
     let (gateway_executor, mut gateway_done_rx, _gateway_done_keepalive) = match &config.gateway {
         Some(gateway) => {
-            let (executor, done_rx) = turn_executor::GatewayExecutor::connect(
-                gateway.socket.clone(),
-                gateway.route_id.clone(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("gateway backend: {e}"))?;
+            let (executor, done_rx) = turn_executor::GatewayExecutor::connect(gateway.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("gateway backend: {e}"))?;
             tracing::info!(
                 socket = %gateway.socket.display(),
                 route = executor.route_id(),
@@ -3856,7 +3853,9 @@ async fn tokio_main() -> Result<()> {
                         spawn_failure_notice(
                             Some(&ctx.rest_client),
                             &done.batch,
-                            format!("⚠️ I couldn't process this: the gateway turn failed ({reason})."),
+                            format!(
+                                "⚠️ I couldn't process this: the gateway turn failed ({reason})."
+                            ),
                         );
                     }
                     turn_executor::TurnOutcome::UnknownOutcome { reason } => {
@@ -4509,7 +4508,7 @@ fn dispatch_pending(
     observer: Option<&observer::ObserverHandle>,
 ) -> Vec<(scope::SessionScope, ThreadTags)> {
     if let Some(gateway) = ctx.gateway_executor.as_ref() {
-        let dispatched = dispatch_pending_gateway(gateway, queue);
+        let dispatched = dispatch_pending_gateway(gateway, queue, ctx);
         if !dispatched.is_empty() {
             *last_activity = tokio::time::Instant::now();
         }
@@ -4745,6 +4744,7 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
 fn dispatch_pending_gateway(
     gateway: &std::sync::Arc<turn_executor::GatewayExecutor>,
     queue: &mut EventQueue,
+    ctx: &Arc<PromptContext>,
 ) -> Vec<(scope::SessionScope, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
     while let Some(batch) = queue.flush_next() {
@@ -4755,7 +4755,7 @@ fn dispatch_pending_gateway(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
-        let turn_id = gateway.spawn_turn(batch);
+        let turn_id = gateway.spawn_turn(batch, Arc::clone(ctx));
         tracing::debug!(
             channel = %channel_id,
             scope = %scope.telemetry_label(),
