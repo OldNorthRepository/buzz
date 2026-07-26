@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::{
-    default_start_on_app_launch, validate_respond_to_allowlist, AgentDefinition, BackendKind,
-    CatalogSource, RelayMeshConfig, RespondTo,
+    default_new_agent_start_on_app_launch, validate_respond_to_allowlist, AgentDefinition,
+    BackendKind, CatalogSource, RelayMeshConfig, RespondTo,
 };
 
 /// The NIP-AP behavioral group as one grouped request field.
@@ -172,7 +172,9 @@ pub struct CreateManagedAgentRequest {
     pub env_vars: BTreeMap<String, String>,
     #[serde(default)]
     pub spawn_after_create: bool,
-    #[serde(default = "default_start_on_app_launch")]
+    /// New agents stay stopped unless the creator explicitly provisions one
+    /// for app-launch start. Existing persisted records retain their flag.
+    #[serde(default = "default_new_agent_start_on_app_launch")]
     pub start_on_app_launch: bool,
     #[serde(default)]
     pub backend: BackendKind,

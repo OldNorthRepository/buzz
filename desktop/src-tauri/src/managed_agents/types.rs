@@ -797,14 +797,24 @@ pub struct UpdateTeamRequest {
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
 /// ~5 min (320s) — matches the CLI harness default (BUZZ_ACP_IDLE_TIMEOUT).
 pub const DEFAULT_AGENT_TURN_TIMEOUT_SECONDS: u64 = 320;
-pub const DEFAULT_AGENT_PARALLELISM: u32 = 10;
+pub const DEFAULT_AGENT_PARALLELISM: u32 = 1;
 
 fn default_agent_parallelism() -> u32 {
     DEFAULT_AGENT_PARALLELISM
 }
 
+// Preserve the historical default when reading a persisted record that predates
+// this field. New create requests use `default_new_agent_start_on_app_launch`
+// instead, so this never changes an existing agent's launch policy.
 fn default_start_on_app_launch() -> bool {
     true
+}
+
+/// Fail closed for new agents until an authoritative core-control roster is
+/// available. Callers that intentionally provision a control agent must set
+/// `startOnAppLaunch: true` explicitly.
+pub(crate) fn default_new_agent_start_on_app_launch() -> bool {
+    false
 }
 
 fn default_auto_restart_on_config_change() -> bool {
