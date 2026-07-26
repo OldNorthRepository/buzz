@@ -101,6 +101,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: runtime_name.clone(),
         relay_url: config.relay_url.clone(),
+        gateway_executor: None,
     });
 
     let startup = PoolStartup {

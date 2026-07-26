@@ -71,6 +71,16 @@ pub enum GatewayExecutorError {
     RouteMissing(String),
 }
 
+/// Completion of one gateway-dispatched turn, delivered to the main loop on
+/// the receiver returned by [`GatewayExecutor::connect`].
+pub(crate) struct GatewayTurnDone {
+    pub channel_id: Uuid,
+    pub turn_id: String,
+    pub outcome: TurnOutcome,
+    /// The dispatched batch, kept for failure notices.
+    pub batch: FlushBatch,
+}
+
 /// Turn executor backed by a host agent-gateway daemon.
 pub struct GatewayExecutor {
     client: ControlClient,
@@ -78,28 +88,74 @@ pub struct GatewayExecutor {
     /// turn_id -> gateway job id, for cancellation. Entries are removed when
     /// a turn reaches a terminal outcome.
     jobs: Mutex<HashMap<String, String>>,
+    /// channel_id -> in-flight turn_id, for `!cancel` routing.
+    channels: Mutex<HashMap<Uuid, String>>,
+    notify: tokio::sync::mpsc::UnboundedSender<GatewayTurnDone>,
 }
 
 impl GatewayExecutor {
     /// Connects, authenticates, and verifies the configured route exists so a
     /// misconfigured socket or missing route fails at startup, not at first
     /// dispatch.
-    pub async fn connect(socket: PathBuf, route_id: String) -> Result<Self, GatewayExecutorError> {
+    pub(crate) async fn connect(
+        socket: PathBuf,
+        route_id: String,
+    ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<GatewayTurnDone>), GatewayExecutorError>
+    {
         let client = ControlClient::connect(Endpoint::Socket(socket)).await?;
         client.status().await?;
         let routes = client.routes().await?;
         if !routes.routes.iter().any(|route| route.id == route_id) {
             return Err(GatewayExecutorError::RouteMissing(route_id));
         }
-        Ok(Self {
-            client,
-            route_id,
-            jobs: Mutex::new(HashMap::new()),
-        })
+        let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok((
+            Self {
+                client,
+                route_id,
+                jobs: Mutex::new(HashMap::new()),
+                channels: Mutex::new(HashMap::new()),
+                notify,
+            },
+            done_rx,
+        ))
     }
 
     pub fn route_id(&self) -> &str {
         &self.route_id
+    }
+
+    /// Fire-and-forget dispatch of one flushed batch; completion arrives on
+    /// the receiver returned by `connect`. Returns the turn id.
+    pub(crate) fn spawn_turn(self: &std::sync::Arc<Self>, batch: FlushBatch) -> String {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let payload = encode_turn_payload(&batch);
+        let executor = std::sync::Arc::clone(self);
+        let id = turn_id.clone();
+        tokio::spawn(async move {
+            let channel_id = batch.channel_id;
+            executor.channels.lock().await.insert(channel_id, id.clone());
+            let outcome = executor.run_turn(channel_id, &id, payload, None).await;
+            executor.channels.lock().await.remove(&channel_id);
+            let _ = executor.notify.send(GatewayTurnDone {
+                channel_id,
+                turn_id: id,
+                outcome,
+                batch,
+            });
+        });
+        turn_id
+    }
+
+    /// `!cancel` entry point: cancels the channel's in-flight gateway turn,
+    /// if any. Completion still arrives through the done channel (the job
+    /// resolves to canceled/reconciling and the poll loop reports it).
+    pub(crate) async fn cancel_channel(&self, channel_id: Uuid) -> bool {
+        let turn = self.channels.lock().await.get(&channel_id).cloned();
+        match turn {
+            Some(turn_id) => self.cancel_turn(&turn_id).await,
+            None => false,
+        }
     }
 }
 
@@ -185,9 +241,6 @@ impl TurnExecutor for GatewayExecutor {
 /// Wire form of one turn: the raw queued relay events for a channel. The GWP
 /// worker rebuilds a [`FlushBatch`] from this and runs the same prompt
 /// assembly as the local pool, so prompt semantics never fork.
-// Consumed by the north-side dispatch wiring (next change); the roundtrip
-// test below keeps it honest until then.
-#[allow(dead_code)]
 pub(crate) fn encode_turn_payload(batch: &FlushBatch) -> serde_json::Value {
     fn event(entry: &BatchEvent) -> serde_json::Value {
         serde_json::json!({"event": entry.event, "prompt_tag": entry.prompt_tag})
