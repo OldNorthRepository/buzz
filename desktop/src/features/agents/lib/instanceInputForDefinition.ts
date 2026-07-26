@@ -155,7 +155,9 @@ export async function buildInstanceInputForDefinition(
     model: persona.model ?? undefined,
     provider: persona.provider ?? undefined,
     spawnAfterCreate: true,
-    startOnAppLaunch: true,
+    // Ordinary definition-backed agents are demand-started. Control agents
+    // must opt in through an explicit creation/update path.
+    startOnAppLaunch: false,
     backend: { type: "local" },
   };
 }

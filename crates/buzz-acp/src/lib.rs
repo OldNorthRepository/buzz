@@ -62,6 +62,10 @@ fn is_subcommand(name: &str) -> bool {
 /// Timeout for lightweight helper subcommands (spawn + initialize + model/method probes).
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Every worker initialization path is bounded so a silent adapter cannot
+/// strand a slot in `respawn_in_flight` or prevent harness shutdown.
+const AGENT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1368,6 +1372,33 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
     crash_history.iter().any(|s| s.respawn_in_flight)
 }
 
+/// Run the harness's warm-idle eviction timer and reap every expired adapter.
+///
+/// Workers are removed from the pool before shutdown, so no new prompt can
+/// claim them while they terminate. `AcpClient::shutdown` performs the
+/// graceful-then-force process-group sequence.
+async fn evict_expired_idle_workers(
+    pool: &mut AgentPool,
+    warm_idle: Duration,
+    now: std::time::Instant,
+) -> usize {
+    let expired = pool.take_expired_idle(warm_idle, now);
+    let evicted = expired.len();
+    for mut agent in expired {
+        let index = agent.index;
+        tracing::info!(agent = index, "warm idle expired; shutting down adapter");
+        agent.acp.shutdown().await;
+    }
+    evicted
+}
+
+/// Task resources shared by demand-driven cold starts.
+struct DemandSpawnContext<'a> {
+    tx: &'a mpsc::Sender<RespawnResult>,
+    tasks: &'a mut tokio::task::JoinSet<()>,
+    shutdown: watch::Receiver<()>,
+}
+
 /// Start at most one additional adapter when runnable work has exhausted the
 /// warm pool. Serializing cold starts prevents a message burst from eagerly
 /// materializing every configured slot while still allowing the pool to grow
@@ -1377,8 +1408,7 @@ fn spawn_worker_for_demand(
     queue: &mut EventQueue,
     config: &Config,
     crash_history: &mut [SlotCircuit],
-    respawn_tx: &mpsc::Sender<RespawnResult>,
-    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    demand_spawn: &mut DemandSpawnContext<'_>,
     observer: Option<observer::ObserverHandle>,
 ) {
     if !queue.has_flushable_work() || pool.idle_count() > 0 || any_respawn_in_flight(crash_history)
@@ -1403,9 +1433,19 @@ fn spawn_worker_for_demand(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
-    let guard = RespawnGuard::new(index, respawn_tx.clone());
-    respawn_tasks.spawn(async move {
-        let result = spawn_and_init(&command, &args, &env, has_codex, index, observer).await;
+    let guard = RespawnGuard::new(index, demand_spawn.tx.clone());
+    let shutdown = demand_spawn.shutdown.clone();
+    demand_spawn.tasks.spawn(async move {
+        let result = spawn_and_init(
+            &command,
+            &args,
+            &env,
+            has_codex,
+            index,
+            observer,
+            Some(shutdown),
+        )
+        .await;
         guard.send(result);
     });
 }
@@ -2091,23 +2131,25 @@ async fn tokio_main() -> Result<()> {
 
         if pool_ready {
             if !queue.has_flushable_work() {
-                for mut agent in pool.take_expired_idle(
+                evict_expired_idle_workers(
+                    &mut pool,
                     Duration::from_secs(config.warm_idle_seconds),
                     std::time::Instant::now(),
-                ) {
-                    let index = agent.index;
-                    tracing::info!(agent = index, "warm idle expired; shutting down adapter");
-                    agent.acp.shutdown().await;
-                }
+                )
+                .await;
             }
 
+            let mut demand_spawn = DemandSpawnContext {
+                tx: &respawn_tx,
+                tasks: &mut respawn_tasks,
+                shutdown: shutdown_rx.clone(),
+            };
             spawn_worker_for_demand(
                 &pool,
                 &mut queue,
                 &config,
                 &mut crash_history,
-                &respawn_tx,
-                &mut respawn_tasks,
+                &mut demand_spawn,
                 observer.clone(),
             );
         }
@@ -3057,14 +3099,14 @@ async fn tokio_main() -> Result<()> {
     }
     drop(pool);
 
-    // Abort any in-flight respawn tasks. They may be sleeping in backoff or
-    // running spawn_and_init — either way, we don't want them spawning new
-    // children after the main loop has exited. RespawnGuard::Drop sends a
-    // failure result for aborted tasks, so respawn_in_flight is cleared.
-    respawn_tasks.shutdown().await;
+    // Drain respawn tasks instead of aborting them. `spawn_and_init` bounds
+    // every initialize handshake, and demand wakes also observe the shutdown
+    // watch, so this finishes with an explicit `AcpClient::shutdown()` rather
+    // than dropping a just-spawned child to best-effort cleanup.
+    while respawn_tasks.join_next().await.is_some() {}
 
-    // Drain any respawn results that completed before the abort. Explicitly
-    // shut down returned agents instead of relying on AcpClient::Drop.
+    // Drain returned agents with explicit shutdown rather than relying on
+    // AcpClient::Drop.
     while let Ok(rr) = respawn_rx.try_recv() {
         if let Ok((mut acp, _, _)) = rr.result {
             acp.shutdown().await;
@@ -3895,7 +3937,7 @@ fn recover_panicked_agent(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer, None).await;
         guard.send(result);
     });
 }
@@ -4095,7 +4137,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer, None).await;
         guard.send(result);
     });
 
@@ -4177,7 +4219,7 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
-                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize = tokio::time::timeout(AGENT_INITIALIZE_TIMEOUT, acp.initialize());
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
                         biased;
@@ -4231,7 +4273,10 @@ async fn initialize_agent_pool(
                         acp.shutdown().await;
                     }
                     Err(_) => {
-                        tracing::error!(agent = i, "agent timed out during init (60s)");
+                        tracing::error!(
+                            agent = i,
+                            "agent timed out during init ({AGENT_INITIALIZE_TIMEOUT:?})"
+                        );
                         acp.shutdown().await;
                     }
                 }
@@ -4271,14 +4316,28 @@ async fn spawn_and_init(
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
+    mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
-    match acp.initialize().await {
-        Ok(init_result) => {
+    let initialize = tokio::time::timeout(AGENT_INITIALIZE_TIMEOUT, acp.initialize());
+    let initialize_result = match shutdown.as_mut() {
+        Some(shutdown) => tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                acp.shutdown().await;
+                return Err(anyhow::anyhow!("agent initialization cancelled by shutdown"));
+            }
+            result = initialize => result,
+        },
+        None => initialize.await,
+    };
+
+    match initialize_result {
+        Ok(Ok(init_result)) => {
             tracing::info!("agent initialized: {init_result}");
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
             acp.observe(
@@ -4291,12 +4350,15 @@ async fn spawn_and_init(
             let agent_name = normalized_agent_name(&init_result);
             Ok((acp, protocol_version, agent_name))
         }
-        Err(e) => {
-            // Explicitly shut down the spawned child to prevent zombie/leak.
-            // Drop only does start_kill + try_wait (best-effort); shutdown()
-            // does start_kill + bounded wait (guaranteed reap).
+        Ok(Err(e)) => {
             acp.shutdown().await;
             Err(anyhow::anyhow!("agent initialize failed: {e}"))
+        }
+        Err(_) => {
+            acp.shutdown().await;
+            Err(anyhow::anyhow!(
+                "agent initialization timed out after {AGENT_INITIALIZE_TIMEOUT:?}"
+            ))
         }
     }
 }
@@ -6524,21 +6586,156 @@ mod error_outcome_emission_tests {
         }
     }
 
+    fn enqueue_runnable_work(queue: &mut EventQueue) {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "wake worker")
+            .tags([])
+            .sign_with_keys(&keys)
+            .expect("sign queued test event");
+        assert!(queue.push(crate::queue::QueuedEvent {
+            channel_id: Uuid::new_v4(),
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+    }
+
+    fn returned_agent(
+        index: usize,
+        acp: AcpClient,
+        protocol_version: u32,
+        agent_name: String,
+    ) -> OwnedAgent {
+        OwnedAgent {
+            index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name,
+            goose_system_prompt_supported: None,
+            protocol_version,
+        }
+    }
+
     #[tokio::test]
-    async fn idle_pool_contracts_to_zero_adapters_after_warm_timeout() {
-        let mut pool = AgentPool::from_slots(vec![Some(dummy_agent(0).await)]);
+    async fn idle_contraction_timer_reaches_zero_then_cold_wakes_and_shutdown_reaps() {
+        let mut config = test_config();
+        config.agent_command = "sh".into();
+        config.agent_args = vec![
+            "-c".into(),
+            "while IFS= read -r _; do echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentInfo\":{\"name\":\"test\"}}}'; done".into(),
+        ];
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        enqueue_runnable_work(&mut queue);
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(1);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
 
-        let mut expired = pool.take_expired_idle(Duration::ZERO, std::time::Instant::now());
-        assert_eq!(expired.len(), 1);
-        assert_eq!(pool.idle_count(), 0);
-        assert_eq!(pool.live_count(), 0);
+        // First queued job creates exactly one adapter.
+        let mut demand_spawn = DemandSpawnContext {
+            tx: &respawn_tx,
+            tasks: &mut respawn_tasks,
+            shutdown: shutdown_rx.clone(),
+        };
+        spawn_worker_for_demand(
+            &pool,
+            &mut queue,
+            &config,
+            &mut crash_history,
+            &mut demand_spawn,
+            None,
+        );
+        assert!(crash_history[0].respawn_in_flight);
+        let first = tokio::time::timeout(Duration::from_secs(2), respawn_rx.recv())
+            .await
+            .expect("first cold wake must finish")
+            .expect("respawn sender remains open");
+        crash_history[first.index].respawn_in_flight = false;
+        let (acp, protocol_version, agent_name) = first.result.expect("adapter initializes");
+        pool.return_agent(returned_agent(
+            first.index,
+            acp,
+            protocol_version,
+            agent_name,
+        ));
+        assert_eq!(pool.live_count(), 1, "one queued job starts one adapter");
 
-        expired
-            .pop()
-            .expect("expired adapter must be returned for shutdown")
-            .acp
-            .shutdown()
-            .await;
+        // This is the same timer path the harness runs on every elastic tick.
+        let warm_idle = Duration::from_millis(25);
+        assert_eq!(
+            evict_expired_idle_workers(
+                &mut pool,
+                warm_idle,
+                std::time::Instant::now() + warm_idle,
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "adapter count reaches zero within warm idle"
+        );
+
+        // The pending job supplies demand after zero workers, proving a cold wake.
+        assert!(queue.has_flushable_work());
+        let mut demand_spawn = DemandSpawnContext {
+            tx: &respawn_tx,
+            tasks: &mut respawn_tasks,
+            shutdown: shutdown_rx.clone(),
+        };
+        spawn_worker_for_demand(
+            &pool,
+            &mut queue,
+            &config,
+            &mut crash_history,
+            &mut demand_spawn,
+            None,
+        );
+        let second = tokio::time::timeout(Duration::from_secs(2), respawn_rx.recv())
+            .await
+            .expect("post-contraction cold wake must finish")
+            .expect("respawn sender remains open");
+        crash_history[second.index].respawn_in_flight = false;
+        let (mut acp, _, _) = second.result.expect("post-contraction adapter initializes");
+        acp.shutdown().await;
+
+        // A silent adapter cannot strand the in-flight guard during shutdown;
+        // the wake observes the watch signal and explicitly reaps its child.
+        config.agent_args = vec!["-c".into(), "read _; sleep 30".into()];
+        let mut demand_spawn = DemandSpawnContext {
+            tx: &respawn_tx,
+            tasks: &mut respawn_tasks,
+            shutdown: shutdown_rx,
+        };
+        spawn_worker_for_demand(
+            &pool,
+            &mut queue,
+            &config,
+            &mut crash_history,
+            &mut demand_spawn,
+            None,
+        );
+        shutdown_tx.send(()).expect("wake still observes shutdown");
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), respawn_rx.recv())
+            .await
+            .expect("shutdown must cancel a silent cold wake")
+            .expect("respawn sender remains open");
+        crash_history[cancelled.index].respawn_in_flight = false;
+        assert!(cancelled.result.is_err());
+        assert!(
+            !any_respawn_in_flight(&crash_history),
+            "shutdown completion releases the global cold-wake guard"
+        );
+        while respawn_tasks.join_next().await.is_some() {}
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how

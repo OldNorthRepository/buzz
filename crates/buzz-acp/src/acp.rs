@@ -411,32 +411,50 @@ fn build_client_capabilities() -> serde_json::Value {
 }
 
 impl AcpClient {
-    /// Kill the agent subprocess and wait for it to exit (no zombies).
+    /// Gracefully terminate the agent subprocess, then force-kill it if needed.
     ///
     /// `Drop` only calls `start_kill()` (sends SIGKILL but doesn't reap).
     /// Call this when you need guaranteed cleanup — e.g., in `run_models`
     /// before process exit.
     pub async fn shutdown(&mut self) {
-        // Kill the entire process group when possible. The child was spawned
-        // with process_group(0), so its PID == its PGID. Killing the group
-        // ensures subprocesses (MCP servers, tool processes) are cleaned up
-        // rather than orphaned to init.
-        //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
+        const GRACEFUL_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+        const FORCE_KILL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        // The child owns a process group, so SIGTERM gives ACP adapters and
+        // their MCP/tool children a bounded opportunity to flush session state
+        // and clean up. SIGKILL is deliberately a second step, not the normal
+        // idle-eviction path.
+        if let Some(pid) = self.child.id() {
+            if terminate_process_group(pid) {
+                match tokio::time::timeout(GRACEFUL_SHUTDOWN_GRACE, self.child.wait()).await {
+                    Ok(Ok(_)) => return,
+                    Ok(Err(e)) => {
+                        tracing::debug!("child wait error after SIGTERM: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("child ignored SIGTERM grace period; force-killing");
+                    }
+                }
+            }
+        }
+
+        // Either graceful termination was unavailable (non-Unix or an already
+        // exited child) or the adapter exceeded its grace period. Kill the
+        // whole process group where possible so MCP/tool descendants are not
+        // orphaned, then reap the direct child with a bounded wait.
         match self.child.id() {
             Some(pid) if kill_process_group(pid) => {}
             _ => {
                 let _ = self.child.start_kill();
             }
         }
-        // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
-        // give up and let Drop/OS handle it. An unbounded wait here would
-        // wedge the harness during respawn or shutdown if a child is stuck.
-        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+        match tokio::time::timeout(FORCE_KILL_REAP_TIMEOUT, self.child.wait()).await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!("child wait error after kill: {e}"),
-            Err(_) => tracing::warn!("child did not exit within 5s after SIGKILL — abandoning"),
+            Ok(Err(e)) => tracing::debug!("child wait error after force-kill: {e}"),
+            Err(_) => {
+                tracing::warn!("child did not exit within force-kill reap timeout — abandoning")
+            }
         }
     }
 
@@ -2215,25 +2233,38 @@ impl Drop for AcpClient {
     }
 }
 
-/// Send SIGKILL to an entire process group. Returns `true` if the signal was sent.
+/// Send a signal to an entire process group. Returns `true` if it was sent.
 ///
 /// The child is spawned with `process_group(0)`, so its PID equals its PGID.
-/// Killing the group ensures subprocesses (MCP servers, tool processes) are
-/// cleaned up rather than orphaned to init on repeated crash-recovery cycles.
-///
 /// Uses `nix::sys::signal::killpg` — a safe wrapper around the POSIX `killpg`
 /// syscall — so the crate's `#![deny(unsafe_code)]` policy is preserved.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) -> bool {
-    use nix::sys::signal::{killpg, Signal};
+fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) -> bool {
+    use nix::sys::signal::killpg;
     use nix::unistd::Pid;
 
     // pid == pgid because the child was spawned with process_group(0).
-    killpg(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok()
+    killpg(Pid::from_raw(pid as i32), signal).is_ok()
 }
 
-/// Fallback for non-Unix: process-group kill not available.
-/// Returns `false` so the caller falls back to `child.start_kill()`.
+/// Request graceful termination for an adapter and all of its descendants.
+#[cfg(unix)]
+fn terminate_process_group(pid: u32) -> bool {
+    signal_process_group(pid, nix::sys::signal::Signal::SIGTERM)
+}
+
+/// Send SIGKILL to an adapter and all of its descendants.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> bool {
+    signal_process_group(pid, nix::sys::signal::Signal::SIGKILL)
+}
+
+/// Fallback for non-Unix: process-group signalling is unavailable.
+#[cfg(not(unix))]
+fn terminate_process_group(_pid: u32) -> bool {
+    false
+}
+
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) -> bool {
     false

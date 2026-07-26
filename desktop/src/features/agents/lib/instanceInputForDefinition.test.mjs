@@ -153,13 +153,13 @@ test("mapping carries the runtime and definition fields", async () => {
   assert.equal(input.model, undefined);
   assert.equal(input.provider, undefined);
   assert.equal(input.spawnAfterCreate, true);
-  assert.equal(input.startOnAppLaunch, true);
+  assert.equal(input.startOnAppLaunch, false);
   assert.deepEqual(input.backend, { type: "local" });
 });
 
-test("no backend intent is byte-identical to the pre-intent mapping", async () => {
+test("ordinary local definitions are demand-started", async () => {
   // The 3 pre-B5 call sites (useManagedAgentActions, usePersonaActions,
-  // UserProfilePanel) pass no intent; their output must not move.
+  // UserProfilePanel) all route through this policy boundary.
   // B-5: agentArgs is [] — args are NOT seeded from the definition at create
   // time. Spawn reads live args from the definition on every start.
   const input = await buildInstanceInputForDefinition(persona(), gooseRuntime);
@@ -176,7 +176,7 @@ test("no backend intent is byte-identical to the pre-intent mapping", async () =
     model: undefined,
     provider: undefined,
     spawnAfterCreate: true,
-    startOnAppLaunch: true,
+    startOnAppLaunch: false,
     backend: { type: "local" },
   });
 });
@@ -194,7 +194,7 @@ test("Buzz shared compute definition carries native provider and auto model", as
   assert.equal(input.provider, "relay-mesh");
   assert.equal(input.model, "auto");
   assert.equal(input.spawnAfterCreate, true);
-  assert.equal(input.startOnAppLaunch, true);
+  assert.equal(input.startOnAppLaunch, false);
 });
 
 test("provider intent forces startOnAppLaunch off and omits local commands", async () => {
