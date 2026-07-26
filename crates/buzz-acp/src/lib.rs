@@ -1379,19 +1379,24 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
     crash_history.iter().any(|s| s.respawn_in_flight)
 }
 
-/// Run the harness's warm-idle eviction timer and reap every expired adapter.
+/// Schedule the harness's warm-idle eviction reapers for every expired adapter.
 ///
 /// Workers are removed from the pool before shutdown, so no new prompt can
 /// claim them while they terminate. `AcpClient::shutdown` performs the
 /// graceful-then-force process-group sequence.
-async fn evict_expired_idle_workers(
+fn schedule_expired_idle_evictions(
     pool: &mut AgentPool,
     warm_idle: Duration,
     now: std::time::Instant,
+    reapers: &mut tokio::task::JoinSet<()>,
 ) -> usize {
     let expired = pool.take_expired_idle(warm_idle, now);
     let evicted = expired.len();
-    shutdown_owned_agents_concurrently(expired, "warm idle eviction").await;
+    if !expired.is_empty() {
+        reapers.spawn(async move {
+            shutdown_owned_agents_concurrently(expired, "warm idle eviction").await;
+        });
+    }
     evicted
 }
 
@@ -1402,6 +1407,24 @@ async fn evict_expired_idle_workers(
 async fn shutdown_owned_agents_concurrently(agents: Vec<OwnedAgent>, reason: &'static str) {
     let clients = agents.into_iter().map(|agent| agent.acp).collect();
     shutdown_acp_clients_concurrently(clients, reason).await;
+}
+
+/// Give a client to a runtime-owned reaper when its normal result consumer is
+/// gone. This is called only from Tokio tasks; the fallback retains the
+/// existing direct-child kill in `AcpClient::Drop` if the runtime is already
+/// unavailable during process teardown.
+fn hand_off_client_to_reaper(mut client: AcpClient, reason: &'static str) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                tracing::warn!(%reason, "reaping client whose owner task lost its receiver");
+                client.shutdown().await;
+            });
+        }
+        Err(error) => {
+            tracing::error!(%reason, "cannot schedule client reaper outside Tokio runtime: {error}");
+        }
+    }
 }
 
 async fn shutdown_acp_clients_concurrently(mut clients: Vec<AcpClient>, reason: &'static str) {
@@ -1423,6 +1446,17 @@ async fn drain_background_tasks(tasks: &mut tokio::task::JoinSet<()>, reason: &'
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
             tracing::warn!(%reason, "background task failed during shutdown: {error}");
+        }
+    }
+}
+
+/// Remove completed background tasks as part of the steady-state loop. `JoinSet`
+/// retains completed task outputs until they are joined, so leaving this to
+/// shutdown makes a long-lived idle harness accumulate task records forever.
+fn reap_completed_background_tasks(tasks: &mut tokio::task::JoinSet<()>, reason: &'static str) {
+    while let Some(Some(result)) = tasks.join_next().now_or_never() {
+        if let Err(error) = result {
+            tracing::warn!(%reason, "background task failed: {error}");
         }
     }
 }
@@ -1568,7 +1602,14 @@ impl RespawnGuard {
                     agent = self.index,
                     "respawn result channel full or closed: {e}"
                 );
-                // Drop will fire and send a failure result as fallback.
+                // A completed respawn can own a live child when the main
+                // loop has already gone away. Transfer it to an async reaper
+                // instead of dropping it into AcpClient's best-effort Drop.
+                let RespawnResult { result, .. } = e.into_inner();
+                if let Ok((client, _, _)) = result {
+                    hand_off_client_to_reaper(client, "undeliverable respawn result");
+                }
+                // Drop still sends a failure result as a guard fallback.
             }
         }
     }
@@ -2058,6 +2099,10 @@ async fn tokio_main() -> Result<()> {
     let mut respawn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let (wake_tx, mut wake_rx) = mpsc::channel::<(u32, Result<AgentPool, String>)>(1);
     let mut wake_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Idle eviction owns adapter clients while their graceful reapers run.
+    // Keep those reapers separate from the main loop so receiving shutdown is
+    // never delayed by an in-arm ElasticTick grace period.
+    let mut eviction_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     // Channel for non-cancelling steer ack watchers to forward outcomes back
     // to the main loop. Each `pool.send_steer(...) == Ok(())` spawns a
@@ -2073,6 +2118,9 @@ async fn tokio_main() -> Result<()> {
 
     // ── Step 7: Shutdown signal ───────────────────────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+    // Set in the select arm which first observes shutdown. This intentionally
+    // precedes every teardown await, including idle eviction reapers.
+    let mut shutdown_deadline = None;
 
     let tx = shutdown_tx.clone();
     tokio::spawn(async move {
@@ -2149,6 +2197,10 @@ async fn tokio_main() -> Result<()> {
     }
 
     loop {
+        reap_completed_background_tasks(&mut respawn_tasks, "respawn");
+        reap_completed_background_tasks(&mut wake_tasks, "pool wake");
+        reap_completed_background_tasks(&mut eviction_tasks, "warm idle eviction");
+
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -2273,8 +2325,10 @@ async fn tokio_main() -> Result<()> {
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
                 // are in-flight tasks.
-                Some(Err(e)) = join_set.join_next(), if !join_set.is_empty() => {
-                    Some(PoolEvent::Panic(e))
+                Some(join_result) = join_set.join_next(), if !join_set.is_empty() => {
+                    // Join successful tasks too. Their PromptResult travels on
+                    // result_rx, but JoinSet still owns a completion record.
+                    join_result.err().map(PoolEvent::Panic)
                 }
                 // Goose-native steer ack from a watcher task. Outcomes drive
                 // queue side-effects (drop / release withheld event) and
@@ -2300,22 +2354,24 @@ async fn tokio_main() -> Result<()> {
                     }
                 } => None,
                 _ = elastic_tick.tick(), if pool_ready => Some(PoolEvent::ElasticTick),
-                Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
-                    if let Some(attempt) = pool_lifecycle.waking_attempt() {
-                        let message = format!("pool wake task failed: {error}");
-                        if pool_lifecycle.cancel_wake(
-                            attempt,
-                            message.clone(),
-                            tokio::time::Instant::now(),
-                        ) {
-                            emit_runtime_lifecycle(
-                                observer.as_ref(),
-                                &runtime_start_nonce,
-                                &pubkey_hex,
-                                &config.relay_url,
-                                "failed",
-                                Some(&message),
-                            );
+                Some(join_result) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
+                    if let Err(error) = join_result {
+                        if let Some(attempt) = pool_lifecycle.waking_attempt() {
+                            let message = format!("pool wake task failed: {error}");
+                            if pool_lifecycle.cancel_wake(
+                                attempt,
+                                message.clone(),
+                                tokio::time::Instant::now(),
+                            ) {
+                                emit_runtime_lifecycle(
+                                    observer.as_ref(),
+                                    &runtime_start_nonce,
+                                    &pubkey_hex,
+                                    &config.relay_url,
+                                    "failed",
+                                    Some(&message),
+                                );
+                            }
                         }
                     }
                     None
@@ -2805,7 +2861,8 @@ async fn tokio_main() -> Result<()> {
                     None
                 }
                 _ = shutdown_rx.changed() => {
-                    tracing::info!("shutting down");
+                    shutdown_deadline = Some(tokio::time::Instant::now() + HARNESS_SHUTDOWN_DEADLINE);
+                    tracing::info!(?shutdown_deadline, "shutting down");
                     break;
                 }
             }
@@ -3027,12 +3084,16 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::ElasticTick) if !queue.has_flushable_work() => {
-                evict_expired_idle_workers(
+                // Remove expired agents synchronously, then hand client
+                // ownership to independent reapers. Do not await here: a
+                // shutdown arriving during TERM grace must enter its single
+                // global deadline immediately rather than after this tick.
+                schedule_expired_idle_evictions(
                     &mut pool,
                     Duration::from_secs(config.warm_idle_seconds),
                     std::time::Instant::now(),
-                )
-                .await;
+                    &mut eviction_tasks,
+                );
             }
             Some(PoolEvent::ElasticTick) => {}
             Some(PoolEvent::Wake(attempt, result)) => {
@@ -3080,36 +3141,49 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    // One deadline covers every shutdown participant. Signal all cooperative
-    // tasks first, then drain wakeups, prompts, and respawns concurrently so a
-    // stuck initialization or a large pool cannot add serial grace windows.
+    // One deadline covers every shutdown participant. It begins in the
+    // signal-select arm (rather than after a potentially slow tick); synthetic
+    // exits establish the same deadline here.
     let _ = shutdown_tx.send(());
-    let shutdown_deadline = tokio::time::Instant::now() + HARNESS_SHUTDOWN_DEADLINE;
+    let shutdown_deadline = shutdown_deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + HARNESS_SHUTDOWN_DEADLINE);
     for task in pool.task_map_mut().values_mut() {
         if let Some(control) = task.control_tx.take() {
             let _ = control.send(ControlSignal::Cancel);
         }
     }
 
-    let idle_agents = pool
+    let idle_agents: Vec<OwnedAgent> = pool
         .agents_mut()
         .iter_mut()
         .filter_map(Option::take)
         .collect();
+    if !idle_agents.is_empty() {
+        eviction_tasks.spawn(async move {
+            shutdown_owned_agents_concurrently(idle_agents, "idle pool cleanup").await;
+        });
+    }
     let shutdown_result = tokio::time::timeout_at(shutdown_deadline, async {
         tokio::join!(
             drain_background_tasks(&mut wake_tasks, "pool wake"),
             drain_background_tasks(&mut pool.join_set, "in-flight prompt"),
             drain_background_tasks(&mut respawn_tasks, "respawn"),
-            shutdown_owned_agents_concurrently(idle_agents, "idle pool cleanup"),
+            drain_background_tasks(&mut eviction_tasks, "warm idle eviction"),
         );
     })
     .await;
     if shutdown_result.is_err() {
-        tracing::warn!(timeout = ?HARNESS_SHUTDOWN_DEADLINE, "global shutdown deadline expired; aborting unfinished tasks");
-        wake_tasks.abort_all();
-        pool.join_set.abort_all();
-        respawn_tasks.abort_all();
+        // Never abort a task which may still own an AcpClient: aborting drops
+        // the client into best-effort Drop and can orphan its process group.
+        // All worker-owning tasks were signalled above, so keep reaping them
+        // after recording the breached shared deadline.
+        tracing::warn!(timeout = ?HARNESS_SHUTDOWN_DEADLINE, "global shutdown deadline expired; continuing cooperative client reaping");
+        tokio::join!(
+            drain_background_tasks(&mut wake_tasks, "pool wake"),
+            drain_background_tasks(&mut pool.join_set, "in-flight prompt"),
+            drain_background_tasks(&mut respawn_tasks, "respawn"),
+            drain_background_tasks(&mut eviction_tasks, "warm idle eviction"),
+        );
     }
 
     // Collect every agent returned by cooperative tasks before their state is
@@ -3136,50 +3210,57 @@ async fn tokio_main() -> Result<()> {
             awakened_pools.push(pool);
         }
     }
-    let cleanup_result = tokio::time::timeout_at(shutdown_deadline, async {
-        let wake_cleanup = async {
-            for mut awakened_pool in awakened_pools {
-                shutdown_agent_pool(&mut awakened_pool).await;
-            }
-        };
-        tokio::join!(
-            shutdown_owned_agents_concurrently(returned_agents, "returned prompt cleanup"),
-            shutdown_acp_clients_concurrently(respawned_clients, "respawn cleanup"),
-            wake_cleanup,
-        );
-    })
-    .await;
-    if cleanup_result.is_err() {
-        tracing::warn!("global shutdown deadline expired before all returned agents were reaped");
+    if !returned_agents.is_empty() {
+        eviction_tasks.spawn(async move {
+            shutdown_owned_agents_concurrently(returned_agents, "returned prompt cleanup").await;
+        });
     }
+    if !respawned_clients.is_empty() {
+        eviction_tasks.spawn(async move {
+            shutdown_acp_clients_concurrently(respawned_clients, "respawn cleanup").await;
+        });
+    }
+    for mut awakened_pool in awakened_pools {
+        shutdown_agent_pool(&mut awakened_pool).await;
+    }
+    // These reapers retain client ownership even after the deadline audit point;
+    // never cancel their futures and thereby fall back to AcpClient::Drop.
+    drain_background_tasks(&mut eviction_tasks, "returned adapter cleanup").await;
     drop(pool);
 
-    // Cancel any in-flight presence heartbeat before sending offline.
+    // Cancel the cosmetic heartbeat and join its aborted handle. No worker
+    // ownership is involved, but joining keeps its task record bounded.
     if let Some(h) = presence_task.take() {
         h.abort();
-    }
-
-    // Best-effort: set presence to offline before exiting.
-    if config.presence_enabled {
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            publish_presence(&presence_publisher, &presence_keys, "offline"),
-        )
-        .await
-        {
-            Ok(Ok(_)) => tracing::info!("presence set to offline"),
-            Ok(Err(e)) => tracing::warn!("failed to set offline presence: {e}"),
-            Err(_) => tracing::warn!("offline presence timed out"),
-        }
+        let _ = h.await;
     }
 
     if let Some(handle) = relay_observer_publisher_task.take() {
         handle.abort();
+        let _ = handle.await;
     }
 
-    // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
-    // for the background task to finish, rather than aborting immediately (#40).
-    relay.shutdown().await;
+    // Offline publication and relay close consume the *remaining* shutdown
+    // budget; neither gets a fresh per-operation grace window after workers.
+    let relay_cleanup = async {
+        tokio::join!(
+            async {
+                if config.presence_enabled {
+                    match publish_presence(&presence_publisher, &presence_keys, "offline").await {
+                        Ok(()) => tracing::info!("presence set to offline"),
+                        Err(error) => tracing::warn!("failed to set offline presence: {error}"),
+                    }
+                }
+            },
+            relay.shutdown(),
+        );
+    };
+    if tokio::time::timeout_at(shutdown_deadline, relay_cleanup)
+        .await
+        .is_err()
+    {
+        tracing::warn!("global shutdown deadline expired during offline/relay cleanup");
+    }
 
     tracing::info!("buzz-acp stopped");
     Ok(())
@@ -4306,7 +4387,15 @@ async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
 }
 
 async fn shutdown_agent_pool(pool: &mut AgentPool) {
-    pool.join_set.shutdown().await;
+    // An abandoned wake normally has no prompt tasks, but preserve the same
+    // ownership rule if that ever changes: signal, then join; never abort an
+    // AcpClient-owning task into its best-effort Drop path.
+    for task in pool.task_map_mut().values_mut() {
+        if let Some(control) = task.control_tx.take() {
+            let _ = control.send(ControlSignal::Cancel);
+        }
+    }
+    drain_background_tasks(&mut pool.join_set, "abandoned pool prompt").await;
     let mut agents: Vec<OwnedAgent> = Vec::new();
     while let Ok(result) = pool.result_rx_try_recv() {
         agents.push(result.agent);
@@ -6789,8 +6878,25 @@ mod error_outcome_emission_tests {
         .await
         .expect("all adapters must install their TERM traps");
 
+        let mut pool = AgentPool::from_slots(agents.into_iter().map(Some).collect());
+        let mut reapers = tokio::task::JoinSet::new();
         let started = std::time::Instant::now();
-        shutdown_owned_agents_concurrently(agents, "many-agent shutdown test").await;
+        assert_eq!(
+            schedule_expired_idle_evictions(
+                &mut pool,
+                Duration::ZERO,
+                std::time::Instant::now(),
+                &mut reapers,
+            ),
+            AGENTS,
+            "the production tick must transfer every idle client to its reaper"
+        );
+        assert_eq!(
+            pool.live_count(),
+            0,
+            "all evicted slots leave the pool immediately"
+        );
+        drain_background_tasks(&mut reapers, "many-agent shutdown test").await;
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "{AGENTS} adapters must share one TERM grace window, not wait serially"
@@ -6858,6 +6964,13 @@ mod error_outcome_emission_tests {
             agent_name,
         ));
         assert_eq!(pool.live_count(), 1, "one queued job starts one adapter");
+        let completed_original_job = queue.flush_next().expect("original job is dispatched");
+        queue.mark_complete(completed_original_job.channel_id);
+        assert!(
+            !queue.has_flushable_work(),
+            "the original job must complete before warm-idle eviction"
+        );
+        reap_completed_background_tasks(&mut respawn_tasks, "first cold wake");
 
         // Drive the production elastic timer rather than fabricating a future
         // clock for the eviction helper. A zero warm-idle period makes the
@@ -6872,8 +6985,14 @@ mod error_outcome_emission_tests {
         )
         .await
         .expect("production elastic_tick must fire");
+        let mut eviction_tasks = tokio::task::JoinSet::new();
         assert_eq!(
-            evict_expired_idle_workers(&mut pool, Duration::ZERO, std::time::Instant::now()).await,
+            schedule_expired_idle_evictions(
+                &mut pool,
+                Duration::ZERO,
+                std::time::Instant::now(),
+                &mut eviction_tasks,
+            ),
             1
         );
         assert_eq!(
@@ -6881,8 +7000,13 @@ mod error_outcome_emission_tests {
             0,
             "adapter count reaches zero within warm idle"
         );
+        // This is the same spawned-reaper path used by the production
+        // ElasticTick arm, not a directly-awaited helper cleanup.
+        drain_background_tasks(&mut eviction_tasks, "test warm idle eviction").await;
 
-        // The pending job supplies demand after zero workers, proving a cold wake.
+        // Inject a later event only after the completed original job has
+        // reached zero workers. It supplies fresh demand for the cold wake.
+        enqueue_runnable_work(&mut queue);
         assert!(queue.has_flushable_work());
         let mut demand_spawn = DemandSpawnContext {
             tx: &respawn_tx,
@@ -6960,6 +7084,50 @@ mod error_outcome_emission_tests {
             );
         }
         let _ = std::fs::remove_file(init_marker);
+    }
+
+    #[tokio::test]
+    async fn elastic_tick_reaper_does_not_delay_shutdown_observation() {
+        let mut pool = AgentPool::from_slots(vec![Some(dummy_agent(0).await)]);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(());
+        let mut eviction_tasks = tokio::task::JoinSet::new();
+
+        // Schedule the same in-arm work the production ElasticTick branch
+        // creates, then signal shutdown while the reaper owns the adapter.
+        assert_eq!(
+            schedule_expired_idle_evictions(
+                &mut pool,
+                Duration::ZERO,
+                std::time::Instant::now(),
+                &mut eviction_tasks,
+            ),
+            1
+        );
+        shutdown_tx
+            .send(())
+            .expect("shutdown receiver remains live");
+        tokio::time::timeout(Duration::from_millis(100), shutdown_rx.changed())
+            .await
+            .expect("shutdown must preempt an in-arm eviction")
+            .expect("shutdown watch remains usable");
+
+        // The task owns the client until shutdown completes; join it rather
+        // than aborting it and relying on AcpClient::Drop.
+        drain_background_tasks(&mut eviction_tasks, "test eviction reaper").await;
+    }
+
+    #[tokio::test]
+    async fn completed_background_joinsets_are_reaped_during_normal_operation() {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            tasks.spawn(async {});
+        }
+        tokio::task::yield_now().await;
+        reap_completed_background_tasks(&mut tasks, "test background task");
+        assert!(
+            tasks.is_empty(),
+            "completed JoinSet tasks must not accumulate"
+        );
     }
 
     #[tokio::test]
