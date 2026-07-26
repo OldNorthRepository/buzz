@@ -10,6 +10,7 @@ mod pool_lifecycle;
 mod queue;
 mod relay;
 mod setup_mode;
+pub mod turn_executor;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -1295,6 +1296,30 @@ async fn tokio_main() -> Result<()> {
     }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
+
+    // Gateway execution backend (Phase A spike): connect, authenticate, and
+    // verify the route up front so a bad socket or missing route fails at
+    // startup instead of at first dispatch. Turn dispatch through this
+    // executor is the follow-up wiring change; until it lands the local pool
+    // still executes turns, and the loud warning below keeps that honest.
+    let _gateway_executor = match &config.gateway {
+        Some(gateway) => {
+            let executor = turn_executor::GatewayExecutor::connect(
+                gateway.socket.clone(),
+                gateway.route_id.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("gateway backend: {e}"))?;
+            tracing::warn!(
+                socket = %gateway.socket.display(),
+                route = executor.route_id(),
+                "gateway backend configured and reachable, but turn dispatch \
+                 is not wired yet — turns still run on the local pool"
+            );
+            Some(executor)
+        }
+        None => None,
+    };
 
     let observer = config
         .relay_observer
@@ -4937,6 +4962,7 @@ mod build_mcp_servers_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            gateway: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -5103,6 +5129,7 @@ mod error_outcome_emission_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             lazy_pool: false,
+            gateway: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
