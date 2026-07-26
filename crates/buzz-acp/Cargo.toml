@@ -18,6 +18,9 @@ path = "src/main.rs"
 [dependencies]
 # Internal
 buzz-core = { workspace = true }
+# Agent-gateway control-plane client (gateway execution backend). Path dep for
+# the pilot; graduates to a git/workspace dependency when the backend lands.
+gateway-api = { path = "../../../agent-gateway/crates/gateway-api" }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
 
