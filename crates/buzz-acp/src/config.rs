@@ -30,6 +30,10 @@ pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
 pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 
+/// How long an idle adapter stays warm before the harness terminates it.
+/// A zero-worker pool remains connected to Buzz and cold-starts on demand.
+pub(crate) const DEFAULT_WARM_IDLE_SECONDS: u64 = 300;
+
 /// Upper bound for `max_turn_duration` (7 days). Any higher is operationally
 /// meaningless and risks arithmetic overflow when deriving the in-flight
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
@@ -482,6 +486,15 @@ pub struct CliArgs {
     /// Connect and subscribe before starting the ACP/LLM subprocess pool.
     #[arg(long, env = "BUZZ_ACP_LAZY_POOL", default_value_t = false)]
     pub lazy_pool: bool,
+
+    /// Keep an idle ACP adapter warm for this many seconds before terminating
+    /// it. The harness itself remains connected and cold-wakes on demand.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_WARM_IDLE_SECONDS",
+        default_value_t = DEFAULT_WARM_IDLE_SECONDS
+    )]
+    pub warm_idle_seconds: u64,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -559,6 +572,8 @@ pub struct Config {
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
     pub lazy_pool: bool,
+    /// Duration idle adapters remain warm before the pool contracts to zero.
+    pub warm_idle_seconds: u64,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1107,6 +1122,7 @@ impl Config {
             relay_observer: args.relay_observer,
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
+            warm_idle_seconds: args.warm_idle_seconds,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1478,6 +1494,7 @@ mod tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            warm_idle_seconds: DEFAULT_WARM_IDLE_SECONDS,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -2204,6 +2221,26 @@ channels = "ALL"
         let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool=true"]);
         assert!(args.is_err(), "bool flags do not take an explicit value");
         assert!(CliArgs::parse_from(["buzz-acp", "--private-key", &key, "--lazy-pool"]).lazy_pool);
+    }
+
+    #[test]
+    fn warm_idle_timeout_defaults_and_accepts_an_explicit_value() {
+        let key = "0".repeat(64);
+        assert_eq!(
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key]).warm_idle_seconds,
+            DEFAULT_WARM_IDLE_SECONDS
+        );
+        assert_eq!(
+            CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--warm-idle-seconds",
+                "1",
+            ])
+            .warm_idle_seconds,
+            1
+        );
     }
 
     #[test]

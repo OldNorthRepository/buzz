@@ -22,7 +22,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -225,6 +225,9 @@ impl OwnedAgent {
 /// tasks for panic recovery.
 pub struct AgentPool {
     agents: Vec<Option<OwnedAgent>>,
+    /// Timestamp for each idle slot. Checked-out and empty slots are `None`.
+    /// Keeping this pool-local avoids leaking lifecycle policy into ACP adapters.
+    idle_since: Vec<Option<Instant>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
@@ -575,8 +578,14 @@ impl AgentPool {
     /// the index invariant.
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let now = Instant::now();
+        let idle_since = slots
+            .iter()
+            .map(|slot| slot.as_ref().map(|_| now))
+            .collect();
         Self {
             agents: slots,
+            idle_since,
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -599,13 +608,17 @@ impl AgentPool {
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
+                self.idle_since[i] = None;
                 return self.agents[i].take();
             }
         }
 
         // Pass 2: first idle agent.
         let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
+        idx.map(|i| {
+            self.idle_since[i] = None;
+            self.agents[i].take().unwrap()
+        })
     }
 
     /// Return an agent to its slot after a task completes.
@@ -622,6 +635,27 @@ impl AgentPool {
             );
         }
         self.agents[idx] = Some(agent);
+        self.idle_since[idx] = Some(Instant::now());
+    }
+
+    /// Number of adapters currently idle and available for work.
+    pub fn idle_count(&self) -> usize {
+        self.agents.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// Remove adapters that have stayed idle for `warm_idle`. Checked-out
+    /// adapters are never selected, so no active stream or tool call is cut.
+    pub fn take_expired_idle(&mut self, warm_idle: Duration, now: Instant) -> Vec<OwnedAgent> {
+        let mut expired = Vec::new();
+        for (index, idle_since) in self.idle_since.iter_mut().enumerate() {
+            if idle_since.is_some_and(|since| now.saturating_duration_since(since) >= warm_idle) {
+                *idle_since = None;
+                if let Some(agent) = self.agents[index].take() {
+                    expired.push(agent);
+                }
+            }
+        }
+        expired
     }
 
     /// Whether any agent is currently idle (sitting in its slot).

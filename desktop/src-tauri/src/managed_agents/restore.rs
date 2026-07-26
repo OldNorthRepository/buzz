@@ -336,7 +336,6 @@ pub async fn restore_managed_agents_on_launch(
                                                 app,
                                                 record,
                                                 &key.relay_url,
-                                                true,
                                                 owner_hex_ref,
                                             )
                                         }) {

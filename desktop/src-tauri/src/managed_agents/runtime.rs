@@ -396,7 +396,8 @@ pub(crate) fn configure_runtime_cli(
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
-/// Returns the child process and log path on success. The caller is responsible
+/// Every Desktop launch is lazy: the harness connects first and starts an ACP
+/// adapter only for accepted work. Returns the child process and log path on success. The caller is responsible
 /// for updating `ManagedAgentRecord` fields and inserting into the runtimes map.
 ///
 /// `owner_hex`: the workspace owner's pubkey, used as a fallback for legacy
@@ -405,7 +406,6 @@ pub fn spawn_agent_child(
     app: &AppHandle,
     record: &ManagedAgentRecord,
     relay_url: &str,
-    lazy: bool,
     owner_hex: Option<&str>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
@@ -530,7 +530,9 @@ pub fn spawn_agent_child(
     command.env("RUST_LOG", child_rust_log_filter());
     command.env("BUZZ_PRIVATE_KEY", &record.private_key_nsec);
     command.env("BUZZ_RELAY_URL", &effective_relay_url);
-    command.env("BUZZ_ACP_LAZY_POOL", if lazy { "true" } else { "false" });
+    // Do not leave this to the buzz-acp config default: every Desktop launch
+    // path (manual, restore, and reconcile) must retain idle-safe semantics.
+    command.env("BUZZ_ACP_LAZY_POOL", "true");
     command.env("BUZZ_ACP_AGENT_COMMAND", &resolved_agent_command);
     command.env("BUZZ_ACP_AGENT_ARGS", agent_args.join(","));
     match &resolved_mcp_command {
@@ -951,7 +953,7 @@ pub fn start_managed_agent_process(
     // Scalar PIDs are migration-only and never establish pair liveness.
     record.runtime_pid = None;
 
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
+    let mut process = spawn_agent_child(app, record, &key.relay_url, owner_hex)?;
     let now = now_iso();
     let receipt = super::ManagedAgentRuntimeReceipt {
         key: key.clone(),

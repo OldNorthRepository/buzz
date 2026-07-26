@@ -1368,6 +1368,48 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
     crash_history.iter().any(|s| s.respawn_in_flight)
 }
 
+/// Start at most one additional adapter when runnable work has exhausted the
+/// warm pool. Serializing cold starts prevents a message burst from eagerly
+/// materializing every configured slot while still allowing the pool to grow
+/// as queued work persists.
+fn spawn_worker_for_demand(
+    pool: &AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) {
+    if !queue.has_flushable_work() || pool.idle_count() > 0 || any_respawn_in_flight(crash_history)
+    {
+        return;
+    }
+
+    let mut selected = None;
+    for (index, slot) in crash_history.iter_mut().enumerate() {
+        if !pool.slot_alive(index) && slot.can_refill() {
+            selected = Some((index, slot));
+            break;
+        }
+    }
+    let Some((index, slot)) = selected else {
+        return;
+    };
+
+    slot.respawn_in_flight = true;
+    tracing::info!(agent = index, "queued work requires a cold adapter start");
+    let command = config.agent_command.clone();
+    let args = config.agent_args.clone();
+    let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
+    let guard = RespawnGuard::new(index, respawn_tx.clone());
+    respawn_tasks.spawn(async move {
+        let result = spawn_and_init(&command, &args, &env, has_codex, index, observer).await;
+        guard.send(result);
+    });
+}
+
 /// Result of a background respawn task.
 struct RespawnResult {
     index: usize,
@@ -1596,10 +1638,11 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
+    let startup = PoolStartup::from_config(&config, observer.clone());
     let mut pool = if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
-        initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
+        initialize_agent_pool(&startup, None, config.agents as usize).await?
     };
     let mut pool_ready = !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
@@ -1900,6 +1943,13 @@ async fn tokio_main() -> Result<()> {
         ))
     };
 
+    // The one-second cadence drives warm-idle contraction even when the relay
+    // is otherwise quiet. Worker startup itself remains demand-driven.
+    let mut elastic_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+
     // Runs at the TOP of every loop iteration via Instant check — cannot be
     // starved by the biased select. Slot refill spawns background tasks so
     // spawn_and_init never blocks the main loop.
@@ -2026,7 +2076,7 @@ async fn tokio_main() -> Result<()> {
                 let wake_tx = wake_tx.clone();
                 let wake_shutdown = shutdown_rx.clone();
                 wake_tasks.spawn(async move {
-                    let result = initialize_agent_pool(&startup, Some(wake_shutdown))
+                    let result = initialize_agent_pool(&startup, Some(wake_shutdown), 1)
                         .await
                         .map_err(|error| error.to_string());
                     if let Err(error) = wake_tx.send((attempt, result)).await {
@@ -2039,33 +2089,32 @@ async fn tokio_main() -> Result<()> {
             }
         }
 
+        if pool_ready {
+            if !queue.has_flushable_work() {
+                for mut agent in pool.take_expired_idle(
+                    Duration::from_secs(config.warm_idle_seconds),
+                    std::time::Instant::now(),
+                ) {
+                    let index = agent.index;
+                    tracing::info!(agent = index, "warm idle expired; shutting down adapter");
+                    agent.acp.shutdown().await;
+                }
+            }
+
+            spawn_worker_for_demand(
+                &pool,
+                &mut queue,
+                &config,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                observer.clone(),
+            );
+        }
+
         if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
-
-            // Slot refill: spawn background tasks for empty slots whose
-            // circuit breaker allows it. spawn_and_init runs off the main
-            // loop so it never blocks event processing.
-            for (idx, slot) in crash_history.iter_mut().enumerate() {
-                if pool.slot_alive(idx) || slot.respawn_in_flight {
-                    continue;
-                }
-                if !slot.can_refill() {
-                    continue;
-                }
-                slot.respawn_in_flight = true;
-                tracing::info!(agent = idx, "slot refill: spawning background respawn");
-                let cmd = config.agent_command.clone();
-                let args = config.agent_args.clone();
-                let env = config.persona_env_vars.clone();
-                let has_codex = config.has_generated_codex_config;
-                let observer = observer.clone();
-                let guard = RespawnGuard::new(idx, respawn_tx.clone());
-                respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
-                    guard.send(result);
-                });
-            }
 
             // Flush requeued batches whose retry_after has expired. Without
             // this, a batch requeued during crash recovery can sit idle
@@ -2161,6 +2210,7 @@ async fn tokio_main() -> Result<()> {
                         _ => std::future::pending().await,
                     }
                 } => None,
+                _ = elastic_tick.tick() => None,
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
                     if let Some(attempt) = pool_lifecycle.waking_attempt() {
                         let message = format!("pool wake task failed: {error}");
@@ -4110,11 +4160,13 @@ impl PoolStartup {
 async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
+    initial_workers: usize,
 ) -> Result<AgentPool> {
-    // One agent failing to start must not kill the whole pool.
-    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
-    let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
-    for i in 0..startup.agents as usize {
+    // One agent failing to start must not kill the whole pool. Lazy startup
+    // requests exactly one cold worker; remaining slots are started only when
+    // queued work needs them.
+    let mut agent_slots: Vec<Option<OwnedAgent>> = (0..startup.agents).map(|_| None).collect();
+    for i in 0..initial_workers.min(startup.agents as usize) {
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
@@ -4162,7 +4214,7 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
-                        agent_slots.push(Some(OwnedAgent {
+                        agent_slots[i] = Some(OwnedAgent {
                             index: i,
                             acp,
                             state: SessionState::default(),
@@ -4172,23 +4224,20 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
-                        }));
+                        });
                     }
                     Ok(Err(e)) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
                         acp.shutdown().await;
-                        agent_slots.push(None);
                     }
                     Err(_) => {
                         tracing::error!(agent = i, "agent timed out during init (60s)");
                         acp.shutdown().await;
-                        agent_slots.push(None);
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(agent = i, "agent failed to spawn: {e}");
-                agent_slots.push(None);
             }
         }
     }
@@ -6208,6 +6257,7 @@ mod build_mcp_servers_tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            warm_idle_seconds: config::DEFAULT_WARM_IDLE_SECONDS,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -6430,6 +6480,7 @@ mod error_outcome_emission_tests {
             relay_observer: false,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
+            warm_idle_seconds: config::DEFAULT_WARM_IDLE_SECONDS,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -6471,6 +6522,23 @@ mod error_outcome_emission_tests {
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn idle_pool_contracts_to_zero_adapters_after_warm_timeout() {
+        let mut pool = AgentPool::from_slots(vec![Some(dummy_agent(0).await)]);
+
+        let mut expired = pool.take_expired_idle(Duration::ZERO, std::time::Instant::now());
+        assert_eq!(expired.len(), 1);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.live_count(), 0);
+
+        expired
+            .pop()
+            .expect("expired adapter must be returned for shutdown")
+            .acp
+            .shutdown()
+            .await;
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how
