@@ -15,7 +15,6 @@
 //! `reconciling`, never a fabricated clean cancel).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use gateway_api::client::{ClientError, ControlClient, Endpoint};
@@ -23,6 +22,8 @@ use gateway_api::protocol::SubmitJobRequest;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::config::{AutoRouteConfig, GatewayBackendConfig};
+use crate::pool::PromptContext;
 use crate::queue::{BatchEvent, CancelReason, FlushBatch};
 
 /// How often the executor polls a submitted job for its terminal state.
@@ -38,13 +39,19 @@ pub enum TurnOutcome {
     /// The turn ran to completion. `summary` is backend metadata (for the
     /// gateway backend, the worker's result summary), not user-visible
     /// content — agents publish their replies to the relay themselves.
-    Completed { summary: String },
-    Failed { reason: String },
+    Completed {
+        summary: String,
+    },
+    Failed {
+        reason: String,
+    },
     Canceled,
     /// The executor cannot prove what happened (gateway unreachable mid-poll,
     /// or the job itself resolved to `unknown_outcome`). Callers must not
     /// blindly retry: the turn's effects may have happened.
-    UnknownOutcome { reason: String },
+    UnknownOutcome {
+        reason: String,
+    },
 }
 
 /// The seam `dispatch_pending` will program against once local execution is
@@ -84,7 +91,17 @@ pub(crate) struct GatewayTurnDone {
 /// Turn executor backed by a host agent-gateway daemon.
 pub struct GatewayExecutor {
     client: ControlClient,
+    /// Default route for channels with no explicit or auto mapping.
     route_id: String,
+    /// Explicit channel -> route overrides from configuration.
+    channel_routes: HashMap<Uuid, String>,
+    /// Name-convention auto-routing, when enabled.
+    auto_route: Option<AutoRouteConfig>,
+    /// Agent principal of the default route; auto-created routes reuse it.
+    agent_id: String,
+    /// channel -> resolved route decisions (Some(route) or None = default),
+    /// so name resolution and route creation happen once per channel.
+    resolved_routes: Mutex<HashMap<Uuid, Option<String>>>,
     /// turn_id -> gateway job id, for cancellation. Entries are removed when
     /// a turn reaches a terminal outcome.
     jobs: Mutex<HashMap<String, String>>,
@@ -93,26 +110,56 @@ pub struct GatewayExecutor {
     notify: tokio::sync::mpsc::UnboundedSender<GatewayTurnDone>,
 }
 
+/// Turns a channel name into a workspace directory slug: lowercased, with
+/// anything outside [a-z0-9-] collapsed to single dashes.
+pub(crate) fn channel_slug(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut dash = true;
+    for ch in name.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            dash = false;
+        } else if !dash {
+            slug.push('-');
+            dash = true;
+        }
+    }
+    slug.trim_end_matches('-').to_owned()
+}
+
 impl GatewayExecutor {
     /// Connects, authenticates, and verifies the configured route exists so a
     /// misconfigured socket or missing route fails at startup, not at first
     /// dispatch.
     pub(crate) async fn connect(
-        socket: PathBuf,
-        route_id: String,
+        config: GatewayBackendConfig,
     ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<GatewayTurnDone>), GatewayExecutorError>
     {
-        let client = ControlClient::connect(Endpoint::Socket(socket)).await?;
+        let client = ControlClient::connect(Endpoint::Socket(config.socket)).await?;
         client.status().await?;
         let routes = client.routes().await?;
-        if !routes.routes.iter().any(|route| route.id == route_id) {
-            return Err(GatewayExecutorError::RouteMissing(route_id));
+        let Some(default_route) = routes
+            .routes
+            .iter()
+            .find(|route| route.id == config.route_id)
+        else {
+            return Err(GatewayExecutorError::RouteMissing(config.route_id));
+        };
+        for route in config.channel_routes.values() {
+            if !routes.routes.iter().any(|view| &view.id == route) {
+                return Err(GatewayExecutorError::RouteMissing(route.clone()));
+            }
         }
         let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok((
             Self {
                 client,
-                route_id,
+                agent_id: default_route.agent_id.clone(),
+                route_id: config.route_id,
+                channel_routes: config.channel_routes,
+                auto_route: config.auto_route,
+                resolved_routes: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
                 channels: Mutex::new(HashMap::new()),
                 notify,
@@ -121,21 +168,119 @@ impl GatewayExecutor {
         ))
     }
 
+    /// The route a channel's turns run on: explicit mapping first, then the
+    /// name-convention auto route (created on the gateway on first use), then
+    /// the default. Decisions are cached per channel.
+    async fn route_for(&self, channel_id: Uuid, channel_name: Option<&str>) -> String {
+        if let Some(route) = self.channel_routes.get(&channel_id) {
+            return route.clone();
+        }
+        if let Some(decision) = self.resolved_routes.lock().await.get(&channel_id) {
+            return decision.clone().unwrap_or_else(|| self.route_id.clone());
+        }
+        let decision = match (&self.auto_route, channel_name) {
+            (Some(auto), Some(name)) => self.ensure_auto_route(channel_id, auto, name).await,
+            _ => None,
+        };
+        self.resolved_routes
+            .lock()
+            .await
+            .insert(channel_id, decision.clone());
+        decision.unwrap_or_else(|| self.route_id.clone())
+    }
+
+    async fn ensure_auto_route(
+        &self,
+        channel_id: Uuid,
+        auto: &AutoRouteConfig,
+        name: &str,
+    ) -> Option<String> {
+        let slug = channel_slug(name);
+        if slug.is_empty() {
+            return None;
+        }
+        let workspace = auto.root.join(&slug);
+        if !workspace.is_dir() {
+            tracing::info!(
+                channel = %channel_id, %slug,
+                "no workspace directory for channel; using the default route"
+            );
+            return None;
+        }
+        let route_id = format!("ch-{slug}");
+        match self.client.routes().await {
+            Ok(routes) if routes.routes.iter().any(|route| route.id == route_id) => {
+                return Some(route_id);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "route listing failed; using the default route");
+                return None;
+            }
+        }
+        let request = gateway_api::protocol::SetRouteRequest {
+            id: route_id.clone(),
+            agent_id: self.agent_id.clone(),
+            contexts: vec![channel_id.to_string()],
+            runtime: auto.runtime.clone(),
+            model: None,
+            workspace_path: workspace.display().to_string(),
+            session_mode: None,
+            permission_profile: "repository_read".into(),
+            repo_write_concurrency: None,
+            repo_read_concurrency: None,
+            agent_concurrency: None,
+            env_allowlist: std::collections::BTreeMap::new(),
+        };
+        match self.client.set_route(request).await {
+            Ok(_) => {
+                tracing::info!(
+                    channel = %channel_id, route = %route_id, workspace = %workspace.display(),
+                    "auto-created gateway route for channel"
+                );
+                Some(route_id)
+            }
+            Err(error) => {
+                tracing::warn!(%error, route = %route_id,
+                    "auto route creation failed; using the default route");
+                None
+            }
+        }
+    }
+
     pub fn route_id(&self) -> &str {
         &self.route_id
     }
 
     /// Fire-and-forget dispatch of one flushed batch; completion arrives on
     /// the receiver returned by `connect`. Returns the turn id.
-    pub(crate) fn spawn_turn(self: &std::sync::Arc<Self>, batch: FlushBatch) -> String {
+    pub(crate) fn spawn_turn(
+        self: &std::sync::Arc<Self>,
+        batch: FlushBatch,
+        ctx: std::sync::Arc<PromptContext>,
+    ) -> String {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let payload = encode_turn_payload(&batch);
         let executor = std::sync::Arc::clone(self);
         let id = turn_id.clone();
         tokio::spawn(async move {
             let channel_id = batch.channel_id;
-            executor.channels.lock().await.insert(channel_id, id.clone());
-            let outcome = executor.run_turn(channel_id, &id, payload, None).await;
+            let channel_name = ctx
+                .channel_info
+                .resolve(channel_id)
+                .await
+                .map(|info| info.name);
+            let route = executor
+                .route_for(channel_id, channel_name.as_deref())
+                .await;
+            executor
+                .channels
+                .lock()
+                .await
+                .insert(channel_id, id.clone());
+            let outcome = executor
+                .run_turn_on(&route, channel_id, &id, payload, None)
+                .await;
             executor.channels.lock().await.remove(&channel_id);
             let _ = executor.notify.send(GatewayTurnDone {
                 channel_id,
@@ -159,16 +304,17 @@ impl GatewayExecutor {
     }
 }
 
-impl TurnExecutor for GatewayExecutor {
-    async fn run_turn(
+impl GatewayExecutor {
+    async fn run_turn_on(
         &self,
+        route_id: &str,
         channel_id: Uuid,
         turn_id: &str,
         payload: serde_json::Value,
         timeout_ms: Option<i64>,
     ) -> TurnOutcome {
         let request = SubmitJobRequest {
-            route_id: Some(self.route_id.clone()),
+            route_id: Some(route_id.to_owned()),
             agent_id: None,
             context_id: None,
             thread_id: Some(channel_id.to_string()),
@@ -227,6 +373,20 @@ impl TurnExecutor for GatewayExecutor {
         self.jobs.lock().await.remove(turn_id);
         outcome
     }
+}
+
+impl TurnExecutor for GatewayExecutor {
+    async fn run_turn(
+        &self,
+        channel_id: Uuid,
+        turn_id: &str,
+        payload: serde_json::Value,
+        timeout_ms: Option<i64>,
+    ) -> TurnOutcome {
+        let route = self.route_id.clone();
+        self.run_turn_on(&route, channel_id, turn_id, payload, timeout_ms)
+            .await
+    }
 
     async fn cancel_turn(&self, turn_id: &str) -> bool {
         let job_id = self.jobs.lock().await.get(turn_id).cloned();
@@ -236,7 +396,6 @@ impl TurnExecutor for GatewayExecutor {
         }
     }
 }
-
 
 /// Wire form of one turn: the raw queued relay events for a channel. The GWP
 /// worker rebuilds a [`FlushBatch`] from this and runs the same prompt
@@ -294,7 +453,10 @@ pub(crate) fn decode_turn_payload(task: &str) -> Result<FlushBatch, String> {
             })
             .collect()
     }
-    let cancel_reason = match value.get("cancel_reason").and_then(serde_json::Value::as_str) {
+    let cancel_reason = match value
+        .get("cancel_reason")
+        .and_then(serde_json::Value::as_str)
+    {
         Some("interrupt") => Some(CancelReason::Interrupt),
         Some("steer") => Some(CancelReason::Steer),
         Some(other) => return Err(format!("unknown cancel_reason '{other}'")),
@@ -327,7 +489,9 @@ pub fn map_job_state(
         }),
         "canceled" => Some(TurnOutcome::Canceled),
         "unknown_outcome" | "reconciling" => Some(TurnOutcome::UnknownOutcome {
-            reason: reason.unwrap_or("gateway reported unknown outcome").to_owned(),
+            reason: reason
+                .unwrap_or("gateway reported unknown outcome")
+                .to_owned(),
         }),
         _ => None,
     }
@@ -336,7 +500,6 @@ pub fn map_job_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn turn_payload_roundtrips_through_encode_and_decode() {
@@ -371,8 +534,23 @@ mod tests {
     }
 
     #[test]
+    fn channel_slugs_follow_the_directory_convention() {
+        assert_eq!(channel_slug("kanban"), "kanban");
+        assert_eq!(channel_slug("Agent Gateway"), "agent-gateway");
+        assert_eq!(channel_slug("  Boiler!! Room  "), "boiler-room");
+        assert_eq!(channel_slug("émoji 🔥 room"), "moji-room");
+        assert_eq!(channel_slug("---"), "");
+    }
+
+    #[test]
     fn non_terminal_states_keep_polling() {
-        for state in ["received", "queued", "running", "starting_worker", "completing"] {
+        for state in [
+            "received",
+            "queued",
+            "running",
+            "starting_worker",
+            "completing",
+        ] {
             assert_eq!(map_job_state(state, None, None), None, "state {state}");
         }
     }
@@ -409,9 +587,16 @@ mod tests {
 
     #[test]
     fn cancellation_and_unknown_outcomes_are_distinct() {
-        assert_eq!(map_job_state("canceled", None, None), Some(TurnOutcome::Canceled));
+        assert_eq!(
+            map_job_state("canceled", None, None),
+            Some(TurnOutcome::Canceled)
+        );
         assert!(matches!(
-            map_job_state("unknown_outcome", Some("outcome unknown after daemon crash"), None),
+            map_job_state(
+                "unknown_outcome",
+                Some("outcome unknown after daemon crash"),
+                None
+            ),
             Some(TurnOutcome::UnknownOutcome { .. })
         ));
         // A cancelled effectful job parks in `reconciling`; that is an
