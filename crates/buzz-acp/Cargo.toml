@@ -28,7 +28,7 @@ buzz-persona = { path = "../buzz-persona" }
 nostr = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] } # io-std: GWP worker stdin/stdout frames
 
 # WebSocket
 tokio-tungstenite = { workspace = true }

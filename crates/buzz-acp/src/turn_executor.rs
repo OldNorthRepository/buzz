@@ -23,6 +23,8 @@ use gateway_api::protocol::SubmitJobRequest;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::queue::{BatchEvent, CancelReason, FlushBatch};
+
 /// How often the executor polls a submitted job for its terminal state.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Consecutive poll failures tolerated before the turn is declared unknown.
@@ -179,6 +181,80 @@ impl TurnExecutor for GatewayExecutor {
     }
 }
 
+
+/// Wire form of one turn: the raw queued relay events for a channel. The GWP
+/// worker rebuilds a [`FlushBatch`] from this and runs the same prompt
+/// assembly as the local pool, so prompt semantics never fork.
+// Consumed by the north-side dispatch wiring (next change); the roundtrip
+// test below keeps it honest until then.
+#[allow(dead_code)]
+pub(crate) fn encode_turn_payload(batch: &FlushBatch) -> serde_json::Value {
+    fn event(entry: &BatchEvent) -> serde_json::Value {
+        serde_json::json!({"event": entry.event, "prompt_tag": entry.prompt_tag})
+    }
+    serde_json::json!({
+        "v": 1,
+        "channel_id": batch.channel_id,
+        "events": batch.events.iter().map(event).collect::<Vec<_>>(),
+        "cancelled_events": batch.cancelled_events.iter().map(event).collect::<Vec<_>>(),
+        "cancel_reason": batch.cancel_reason.map(|reason| match reason {
+            CancelReason::Interrupt => "interrupt",
+            CancelReason::Steer => "steer",
+        }),
+    })
+}
+
+pub(crate) fn decode_turn_payload(task: &str) -> Result<FlushBatch, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(task).map_err(|e| format!("payload is not JSON: {e}"))?;
+    if value.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("unsupported payload version".into());
+    }
+    let channel_id = value
+        .get("channel_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .ok_or("payload has no channel_id")?;
+    fn events(value: Option<&serde_json::Value>) -> Result<Vec<BatchEvent>, String> {
+        let Some(entries) = value.and_then(serde_json::Value::as_array) else {
+            return Ok(Vec::new());
+        };
+        entries
+            .iter()
+            .map(|entry| {
+                let event = serde_json::from_value(
+                    entry.get("event").cloned().ok_or("entry has no event")?,
+                )
+                .map_err(|e| format!("bad nostr event: {e}"))?;
+                Ok(BatchEvent {
+                    event,
+                    prompt_tag: entry
+                        .get("prompt_tag")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    // Wall-clock queueing latency does not survive the hop;
+                    // the worker measures from receipt, which is what its own
+                    // metrics mean anyway.
+                    received_at: std::time::Instant::now(),
+                })
+            })
+            .collect()
+    }
+    let cancel_reason = match value.get("cancel_reason").and_then(serde_json::Value::as_str) {
+        Some("interrupt") => Some(CancelReason::Interrupt),
+        Some("steer") => Some(CancelReason::Steer),
+        Some(other) => return Err(format!("unknown cancel_reason '{other}'")),
+        None => None,
+    };
+    Ok(FlushBatch {
+        channel_id,
+        events: events(value.get("events"))?,
+        cancelled_events: events(value.get("cancelled_events"))?,
+        cancel_reason,
+    })
+}
+
 /// Maps a gateway job state to a turn outcome. `None` = not terminal yet.
 pub fn map_job_state(
     state: &str,
@@ -207,6 +283,39 @@ pub fn map_job_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn turn_payload_roundtrips_through_encode_and_decode() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::text_note("hello gateway")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: channel,
+            events: vec![BatchEvent {
+                event: event.clone(),
+                prompt_tag: "mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+        let decoded = decode_turn_payload(&encode_turn_payload(&batch).to_string()).unwrap();
+        assert_eq!(decoded.channel_id, channel);
+        assert_eq!(decoded.events.len(), 1);
+        assert_eq!(decoded.events[0].event.id, event.id);
+        assert_eq!(decoded.events[0].prompt_tag, "mention");
+        assert_eq!(decoded.cancel_reason, Some(CancelReason::Steer));
+    }
+
+    #[test]
+    fn a_garbage_payload_is_rejected_not_panicked() {
+        assert!(decode_turn_payload("not json").is_err());
+        assert!(decode_turn_payload("{}").is_err());
+        assert!(decode_turn_payload("{\"v\":2,\"channel_id\":\"x\"}").is_err());
+    }
 
     #[test]
     fn non_terminal_states_keep_polling() {

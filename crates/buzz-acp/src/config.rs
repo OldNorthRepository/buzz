@@ -288,7 +288,20 @@ pub struct CliArgs {
     pub relay_url: String,
 
     #[arg(long, env = "BUZZ_PRIVATE_KEY", hide_env_values = true)]
-    pub private_key: String,
+    pub private_key: Option<String>,
+
+    /// Read the private key from a file (0600) instead of the environment or
+    /// argv. Required for gateway worker mode, where the daemon clears the
+    /// environment and argv is visible in /proc: a key file is the only
+    /// channel that leaks nowhere. Wins over --private-key when both are set.
+    #[arg(long, env = "BUZZ_PRIVATE_KEY_FILE")]
+    pub private_key_file: Option<PathBuf>,
+
+    /// Run as a GWP/0 gateway worker: serve turns over stdin/stdout for an
+    /// agent-gateway daemon instead of subscribing to a relay. One worker =
+    /// one local ACP agent subprocess.
+    #[arg(long, default_value_t = false)]
+    pub gwp_worker: bool,
 
     /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
@@ -633,6 +646,8 @@ pub struct Config {
     /// Gateway execution backend, when `--backend gateway` is configured.
     /// `None` = local pool (today's behavior).
     pub gateway: Option<GatewayBackendConfig>,
+    /// Serve turns as a GWP/0 gateway worker instead of running the harness.
+    pub gwp_worker: bool,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -914,13 +929,24 @@ impl Config {
     /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
     /// validation path without going through process args.
     pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
-        let keys = Keys::parse(&args.private_key)?;
+        // Key file wins over the inline key; exactly one source must exist.
+        let mut raw_key = match (&args.private_key_file, args.private_key.take()) {
+            (Some(path), _) => std::fs::read_to_string(path)?.trim().to_owned(),
+            (None, Some(inline)) => inline,
+            (None, None) => {
+                return Err(ConfigError::ConfigFile(
+                    "a private key is required: set --private-key/BUZZ_PRIVATE_KEY \
+                     or --private-key-file/BUZZ_PRIVATE_KEY_FILE"
+                        .into(),
+                ));
+            }
+        };
+        let keys = Keys::parse(&raw_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
         // crate we can only clear the String — the allocator may retain copies.
-        args.private_key
-            .replace_range(.., &"0".repeat(args.private_key.len()));
-        args.private_key.clear();
+        raw_key.replace_range(.., &"0".repeat(raw_key.len()));
+        raw_key.clear();
 
         let system_prompt = if let Some(text) = args.system_prompt {
             Some(text)
@@ -1182,6 +1208,7 @@ impl Config {
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             warm_idle_seconds: args.warm_idle_seconds,
+            gwp_worker: args.gwp_worker,
             gateway: resolve_gateway_backend(
                 args.backend,
                 args.gateway_socket.clone(),
@@ -1560,6 +1587,7 @@ mod tests {
             lazy_pool: false,
             warm_idle_seconds: DEFAULT_WARM_IDLE_SECONDS,
             gateway: None,
+            gwp_worker: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,

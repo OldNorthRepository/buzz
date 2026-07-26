@@ -9,6 +9,7 @@ mod pool;
 mod pool_lifecycle;
 mod queue;
 mod relay;
+mod gwp_worker;
 mod setup_mode;
 pub mod turn_executor;
 mod usage;
@@ -1734,14 +1735,27 @@ async fn tokio_main() -> Result<()> {
         return run_authenticate(args).await;
     }
 
-    tracing_subscriber::fmt()
+    // In GWP worker mode stdout is the protocol channel, so diagnostics must
+    // go to stderr (the gateway keeps a bounded stderr ring for exactly
+    // this). Sniffed from argv because tracing must exist before config
+    // parsing can report errors through it.
+    let gwp_worker_requested = std::env::args().any(|arg| arg == "--gwp-worker");
+    let tracing_builder = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info")),
         )
-        .compact()
-        .init();
+        .compact();
+    if gwp_worker_requested {
+        tracing_builder.with_writer(std::io::stderr).init();
+    } else {
+        tracing_builder.init();
+    }
 
     let mut config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
+
+    if config.gwp_worker {
+        return gwp_worker::run(config).await;
+    }
 
     // ── Setup-mode early branch ───────────────────────────────────────────────
     //
@@ -6575,6 +6589,7 @@ mod build_mcp_servers_tests {
             lazy_pool: false,
             warm_idle_seconds: config::DEFAULT_WARM_IDLE_SECONDS,
             gateway: None,
+            gwp_worker: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -6799,6 +6814,7 @@ mod error_outcome_emission_tests {
             lazy_pool: false,
             warm_idle_seconds: config::DEFAULT_WARM_IDLE_SECONDS,
             gateway: None,
+            gwp_worker: false,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
