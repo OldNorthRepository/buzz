@@ -66,9 +66,12 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// strand a slot in `respawn_in_flight` or prevent harness shutdown.
 const AGENT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Respawn tasks are cancellation-aware, but retain a global backstop so a
-/// shutdown can never wait forever for a misbehaving runtime or OS primitive.
-const RESPAWN_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// The full harness teardown shares this single deadline. Individual cleanup
+/// activities may start together, but none gets an additional grace window.
+const HARNESS_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Production cadence for elastic warm-idle maintenance.
+const ELASTIC_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
@@ -1388,12 +1391,40 @@ async fn evict_expired_idle_workers(
 ) -> usize {
     let expired = pool.take_expired_idle(warm_idle, now);
     let evicted = expired.len();
-    for mut agent in expired {
-        let index = agent.index;
-        tracing::info!(agent = index, "warm idle expired; shutting down adapter");
-        agent.acp.shutdown().await;
-    }
+    shutdown_owned_agents_concurrently(expired, "warm idle eviction").await;
     evicted
+}
+
+/// Reap independent adapter processes concurrently. This is used for both
+/// warm-idle contraction and harness teardown: every client still performs its
+/// own TERM → grace → KILL → reap sequence, but a full pool never makes the
+/// caller wait that sequence once per agent.
+async fn shutdown_owned_agents_concurrently(agents: Vec<OwnedAgent>, reason: &'static str) {
+    let clients = agents.into_iter().map(|agent| agent.acp).collect();
+    shutdown_acp_clients_concurrently(clients, reason).await;
+}
+
+async fn shutdown_acp_clients_concurrently(mut clients: Vec<AcpClient>, reason: &'static str) {
+    let mut reapers = tokio::task::JoinSet::new();
+    for mut client in clients.drain(..) {
+        reapers.spawn(async move {
+            tracing::debug!(%reason, "shutting down adapter");
+            client.shutdown().await;
+        });
+    }
+    while let Some(result) = reapers.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%reason, "adapter reaper task failed: {error}");
+        }
+    }
+}
+
+async fn drain_background_tasks(tasks: &mut tokio::task::JoinSet<()>, reason: &'static str) {
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%reason, "background task failed during shutdown: {error}");
+        }
+    }
 }
 
 /// Wait for a crash-recovery backoff unless shutdown arrives first.
@@ -2010,8 +2041,8 @@ async fn tokio_main() -> Result<()> {
     // The one-second cadence drives warm-idle contraction even when the relay
     // is otherwise quiet. Worker startup itself remains demand-driven.
     let mut elastic_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(1),
-        Duration::from_secs(1),
+        tokio::time::Instant::now() + ELASTIC_TICK_INTERVAL,
+        ELASTIC_TICK_INTERVAL,
     );
 
     // Runs at the TOP of every loop iteration via Instant check — cannot be
@@ -2114,6 +2145,7 @@ async fn tokio_main() -> Result<()> {
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
+        ElasticTick,
     }
 
     loop {
@@ -2154,15 +2186,6 @@ async fn tokio_main() -> Result<()> {
         }
 
         if pool_ready {
-            if !queue.has_flushable_work() {
-                evict_expired_idle_workers(
-                    &mut pool,
-                    Duration::from_secs(config.warm_idle_seconds),
-                    std::time::Instant::now(),
-                )
-                .await;
-            }
-
             let mut demand_spawn = DemandSpawnContext {
                 tx: &respawn_tx,
                 tasks: &mut respawn_tasks,
@@ -2276,7 +2299,7 @@ async fn tokio_main() -> Result<()> {
                         _ => std::future::pending().await,
                     }
                 } => None,
-                _ = elastic_tick.tick() => None,
+                _ = elastic_tick.tick(), if pool_ready => Some(PoolEvent::ElasticTick),
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
                     if let Some(attempt) = pool_lifecycle.waking_attempt() {
                         let message = format!("pool wake task failed: {error}");
@@ -3003,6 +3026,15 @@ async fn tokio_main() -> Result<()> {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
+            Some(PoolEvent::ElasticTick) if !queue.has_flushable_work() => {
+                evict_expired_idle_workers(
+                    &mut pool,
+                    Duration::from_secs(config.warm_idle_seconds),
+                    std::time::Instant::now(),
+                )
+                .await;
+            }
+            Some(PoolEvent::ElasticTick) => {}
             Some(PoolEvent::Wake(attempt, result)) => {
                 let completion = result.as_ref().map(|_| ()).map_err(|error| error.clone());
                 if let Err(error) =
@@ -3048,110 +3080,79 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    // Drain wake tasks gracefully rather than aborting: an in-flight
-    // initialize_agent_pool observes the shutdown watch at its biased per-slot
-    // select and reaps its partially-spawned agents itself. `shutdown()` here
-    // would abort the task mid-init and drop those AcpClients via best-effort
-    // Drop — the exact zombie class the eager path's spawn-outside-the-timeout
-    // comment exists to prevent. Fire the watch first so exits that bypass the
-    // signal handlers (result channel closed, LoopAction::Exit) cancel the wake
-    // just as promptly. Timeout is a backstop for a slot stuck outside the
-    // select (e.g. in spawn); only then do we fall back to aborting.
+    // One deadline covers every shutdown participant. Signal all cooperative
+    // tasks first, then drain wakeups, prompts, and respawns concurrently so a
+    // stuck initialization or a large pool cannot add serial grace windows.
     let _ = shutdown_tx.send(());
-    let wake_drain = tokio::time::timeout(Duration::from_secs(30), async {
-        while wake_tasks.join_next().await.is_some() {}
-    })
-    .await;
-    if wake_drain.is_err() {
-        tracing::warn!("wake task did not drain within grace period — aborting");
-        wake_tasks.shutdown().await;
-    }
-    while let Ok((_attempt, result)) = wake_rx.try_recv() {
-        if let Ok(mut awakened_pool) = result {
-            shutdown_agent_pool(&mut awakened_pool).await;
+    let shutdown_deadline = tokio::time::Instant::now() + HARNESS_SHUTDOWN_DEADLINE;
+    for task in pool.task_map_mut().values_mut() {
+        if let Some(control) = task.control_tx.take() {
+            let _ = control.send(ControlSignal::Cancel);
         }
     }
 
-    tracing::info!("shutdown: waiting for in-flight prompts");
-    // 30 s is generous for in-flight prompts to be cancelled; using
-    // max_turn_duration here would cause Ctrl+C to hang for up to an hour.
-    let grace = Duration::from_secs(30);
-    // Best-effort drain of both join_set and result_rx during the grace period.
-    // Tasks that finish normally send their OwnedAgent through result_rx — we
-    // explicitly shut them down here to reap child processes. If the grace
-    // period expires, remaining tasks are aborted and fall back to
-    // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
-    let (rx_ref, js_ref) = pool.rx_and_join_set();
-    let shutdown_result = tokio::time::timeout(grace, async {
-        loop {
-            tokio::select! {
-                result = js_ref.join_next() => {
-                    match result {
-                        Some(Err(e)) => tracing::warn!("task error during shutdown: {e}"),
-                        Some(Ok(())) => {}
-                        None => break, // join_set empty
-                    }
-                }
-                maybe_result = rx_ref.recv() => {
-                    if let Some(mut pr) = maybe_result {
-                        let idx = pr.agent.index;
-                        pr.agent.acp.shutdown().await;
-                        tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
-                    }
-                    // If None, channel closed — tasks are done.
-                }
-            }
-        }
+    let idle_agents = pool
+        .agents_mut()
+        .iter_mut()
+        .filter_map(Option::take)
+        .collect();
+    let shutdown_result = tokio::time::timeout_at(shutdown_deadline, async {
+        tokio::join!(
+            drain_background_tasks(&mut wake_tasks, "pool wake"),
+            drain_background_tasks(&mut pool.join_set, "in-flight prompt"),
+            drain_background_tasks(&mut respawn_tasks, "respawn"),
+            shutdown_owned_agents_concurrently(idle_agents, "idle pool cleanup"),
+        );
     })
     .await;
     if shutdown_result.is_err() {
-        tracing::warn!("grace period expired, aborting remaining tasks");
-        pool.join_set.shutdown().await;
-    }
-    // Drain any remaining results that arrived after join_set drained but
-    // before tasks were aborted.
-    while let Ok(mut pr) = pool.result_rx_try_recv() {
-        let idx = pr.agent.index;
-        pr.agent.acp.shutdown().await;
-        tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
-    }
-    // Explicitly shut down idle agents still sitting in their slots.
-    for slot in pool.agents_mut().iter_mut() {
-        if let Some(agent) = slot.take() {
-            let idx = agent.index;
-            let mut acp = agent.acp;
-            acp.shutdown().await;
-            tracing::debug!(agent = idx, "reaped idle agent on shutdown");
-        }
-    }
-    drop(pool);
-
-    // Every respawn path watches shutdown during backoff and initialization,
-    // so this normally drains promptly and lets each task explicitly reap any
-    // child it owns. Keep one global ceiling across *all* crash and demand
-    // respawns: a wedged runtime must not make process shutdown unbounded.
-    let respawn_drain = tokio::time::timeout(RESPAWN_SHUTDOWN_DRAIN_TIMEOUT, async {
-        while respawn_tasks.join_next().await.is_some() {}
-    })
-    .await;
-    if respawn_drain.is_err() {
-        tracing::warn!(
-            timeout = ?RESPAWN_SHUTDOWN_DRAIN_TIMEOUT,
-            "respawn tasks exceeded shutdown drain deadline — aborting"
-        );
-        respawn_tasks.shutdown().await;
+        tracing::warn!(timeout = ?HARNESS_SHUTDOWN_DEADLINE, "global shutdown deadline expired; aborting unfinished tasks");
+        wake_tasks.abort_all();
+        pool.join_set.abort_all();
+        respawn_tasks.abort_all();
     }
 
-    // Each task sends exactly one guarded result, including cancellation, so
-    // clear its slot state while explicitly reaping every successfully
-    // initialized child instead of relying on `AcpClient::Drop`.
+    // Collect every agent returned by cooperative tasks before their state is
+    // discarded. Guards are cleared even when a task was aborted at the shared
+    // deadline, so a stale in-flight bit cannot survive a harness restart.
+    let mut returned_agents = Vec::new();
+    while let Ok(result) = pool.result_rx_try_recv() {
+        returned_agents.push(result.agent);
+    }
+    let mut respawned_clients = Vec::new();
     while let Ok(rr) = respawn_rx.try_recv() {
         crash_history[rr.index].respawn_in_flight = false;
-        if let Ok((mut acp, _, _)) = rr.result {
-            acp.shutdown().await;
-            tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
+        if let Ok((acp, _, _)) = rr.result {
+            respawned_clients.push(acp);
         }
     }
+    for slot in &mut crash_history {
+        slot.respawn_in_flight = false;
+    }
+
+    let mut awakened_pools = Vec::new();
+    while let Ok((_attempt, result)) = wake_rx.try_recv() {
+        if let Ok(pool) = result {
+            awakened_pools.push(pool);
+        }
+    }
+    let cleanup_result = tokio::time::timeout_at(shutdown_deadline, async {
+        let wake_cleanup = async {
+            for mut awakened_pool in awakened_pools {
+                shutdown_agent_pool(&mut awakened_pool).await;
+            }
+        };
+        tokio::join!(
+            shutdown_owned_agents_concurrently(returned_agents, "returned prompt cleanup"),
+            shutdown_acp_clients_concurrently(respawned_clients, "respawn cleanup"),
+            wake_cleanup,
+        );
+    })
+    .await;
+    if cleanup_result.is_err() {
+        tracing::warn!("global shutdown deadline expired before all returned agents were reaped");
+    }
+    drop(pool);
 
     // Cancel any in-flight presence heartbeat before sending offline.
     if let Some(h) = presence_task.take() {
@@ -4300,23 +4301,18 @@ fn normalized_agent_name(init_result: &serde_json::Value) -> String {
 }
 
 async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
-    for slot in slots {
-        if let Some(mut agent) = slot.take() {
-            agent.acp.shutdown().await;
-        }
-    }
+    let agents = slots.iter_mut().filter_map(Option::take).collect();
+    shutdown_owned_agents_concurrently(agents, "pool initialization rollback").await;
 }
 
 async fn shutdown_agent_pool(pool: &mut AgentPool) {
     pool.join_set.shutdown().await;
-    while let Ok(mut result) = pool.result_rx_try_recv() {
-        result.agent.acp.shutdown().await;
+    let mut agents: Vec<OwnedAgent> = Vec::new();
+    while let Ok(result) = pool.result_rx_try_recv() {
+        agents.push(result.agent);
     }
-    for slot in pool.agents_mut() {
-        if let Some(mut agent) = slot.take() {
-            agent.acp.shutdown().await;
-        }
-    }
+    agents.extend(pool.agents_mut().iter_mut().filter_map(Option::take));
+    shutdown_owned_agents_concurrently(agents, "abandoned pool cleanup").await;
 }
 
 struct PoolStartup {
@@ -6763,8 +6759,59 @@ mod error_outcome_emission_tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn idle_contraction_timer_reaches_zero_then_cold_wakes_and_shutdown_reaps() {
+    async fn many_agent_cleanup_reaps_in_parallel_under_one_grace_window() {
+        const AGENTS: usize = 8;
+        let marker_dir =
+            std::env::temp_dir().join(format!("buzz-acp-many-shutdown-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&marker_dir).expect("create marker directory");
+        let mut agents = Vec::with_capacity(AGENTS);
+        for index in 0..AGENTS {
+            let marker = marker_dir.join(index.to_string());
+            let args = vec![
+                "-c".into(),
+                format!(
+                    "trap '' TERM; echo $$ > {}; while :; do sleep 1; done",
+                    marker.display()
+                ),
+            ];
+            let acp = AcpClient::spawn("sh", &args, &[], false)
+                .await
+                .expect("spawn TERM-ignoring adapter");
+            agents.push(returned_agent(index, acp, 1, "test".into()));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while (0..AGENTS).any(|index| !marker_dir.join(index.to_string()).exists()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all adapters must install their TERM traps");
+
+        let started = std::time::Instant::now();
+        shutdown_owned_agents_concurrently(agents, "many-agent shutdown test").await;
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "{AGENTS} adapters must share one TERM grace window, not wait serially"
+        );
+
+        for index in 0..AGENTS {
+            let pid = std::fs::read_to_string(marker_dir.join(index.to_string()))
+                .expect("adapter records its pid")
+                .trim()
+                .parse::<i32>()
+                .expect("recorded pid is numeric");
+            assert!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+                "parallel cleanup must reap adapter {index}"
+            );
+        }
+        std::fs::remove_dir_all(marker_dir).expect("remove marker directory");
+    }
+
+    #[tokio::test]
+    async fn elastic_tick_reaches_zero_then_cold_wakes_and_shutdown_cancels_stuck_init() {
         let mut config = test_config();
         config.agent_command = "sh".into();
         config.agent_args = vec![
@@ -6812,15 +6859,21 @@ mod error_outcome_emission_tests {
         ));
         assert_eq!(pool.live_count(), 1, "one queued job starts one adapter");
 
-        // This is the same timer path the harness runs on every elastic tick.
-        let warm_idle = Duration::from_millis(25);
+        // Drive the production elastic timer rather than fabricating a future
+        // clock for the eviction helper. A zero warm-idle period makes the
+        // next real production tick deterministically eligible for contraction.
+        let mut elastic_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + ELASTIC_TICK_INTERVAL,
+            ELASTIC_TICK_INTERVAL,
+        );
+        tokio::time::timeout(
+            ELASTIC_TICK_INTERVAL + Duration::from_secs(1),
+            elastic_tick.tick(),
+        )
+        .await
+        .expect("production elastic_tick must fire");
         assert_eq!(
-            evict_expired_idle_workers(
-                &mut pool,
-                warm_idle,
-                std::time::Instant::now() + warm_idle,
-            )
-            .await,
+            evict_expired_idle_workers(&mut pool, Duration::ZERO, std::time::Instant::now()).await,
             1
         );
         assert_eq!(

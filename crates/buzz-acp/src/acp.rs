@@ -418,7 +418,6 @@ impl AcpClient {
     /// before process exit.
     pub async fn shutdown(&mut self) {
         const GRACEFUL_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-        const FORCE_KILL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
         // The child owns a process group, so SIGTERM gives ACP adapters and
         // their MCP/tool children a bounded opportunity to flush session state
@@ -452,11 +451,17 @@ impl AcpClient {
                 let _ = self.child.start_kill();
             }
         }
-        match tokio::time::timeout(FORCE_KILL_REAP_TIMEOUT, self.child.wait()).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => tracing::debug!("child wait error after force-kill: {e}"),
-            Err(_) => {
-                tracing::warn!("child did not exit within force-kill reap timeout — abandoning")
+        // Do not put a timeout around this final wait. Once SIGKILL has been
+        // sent, returning before `wait` observes the exit would leak a zombie.
+        // A transient wait error is not proof of reaping, so retain ownership
+        // and retry rather than returning with an uncertain child.
+        loop {
+            match self.child.wait().await {
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!("child wait error after force-kill; retrying reap: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
             }
         }
     }

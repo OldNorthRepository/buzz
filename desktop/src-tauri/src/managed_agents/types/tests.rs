@@ -289,10 +289,9 @@ fn new_agent_create_request_is_not_auto_started_without_explicit_opt_in() {
         "new repository agents must not implicitly fan out on app launch"
     );
 
-    let explicit: CreateManagedAgentRequest = serde_json::from_str(
-        r#"{"name": "control-agent", "startOnAppLaunch": true}"#,
-    )
-    .expect("explicit launch policy must deserialize");
+    let explicit: CreateManagedAgentRequest =
+        serde_json::from_str(r#"{"name": "control-agent", "startOnAppLaunch": true}"#)
+            .expect("explicit launch policy must deserialize");
     assert!(explicit.start_on_app_launch);
 }
 
