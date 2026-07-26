@@ -2525,28 +2525,32 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
-    // Gateway execution backend (Phase A spike): connect, authenticate, and
-    // verify the route up front so a bad socket or missing route fails at
-    // startup instead of at first dispatch. Turn dispatch through this
-    // executor is the follow-up wiring change; until it lands the local pool
-    // still executes turns, and the loud warning below keeps that honest.
-    let _gateway_executor = match &config.gateway {
+    // Gateway execution backend: connect, authenticate, and verify the route
+    // up front so a bad socket or missing route fails at startup instead of
+    // at first dispatch. When active, no local ACP subprocesses are spawned;
+    // `dispatch_pending` routes every turn to the daemon and completions
+    // arrive on `gateway_done_rx`.
+    let (gateway_executor, mut gateway_done_rx, _gateway_done_keepalive) = match &config.gateway {
         Some(gateway) => {
-            let executor = turn_executor::GatewayExecutor::connect(
+            let (executor, done_rx) = turn_executor::GatewayExecutor::connect(
                 gateway.socket.clone(),
                 gateway.route_id.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("gateway backend: {e}"))?;
-            tracing::warn!(
+            tracing::info!(
                 socket = %gateway.socket.display(),
                 route = executor.route_id(),
-                "gateway backend configured and reachable, but turn dispatch \
-                 is not wired yet — turns still run on the local pool"
+                "gateway execution backend active — local ACP pool disabled"
             );
-            Some(executor)
+            (Some(std::sync::Arc::new(executor)), done_rx, None)
         }
-        None => None,
+        None => {
+            // Dummy channel: the select arm below never fires, and the held
+            // sender keeps recv() pending instead of resolving to None.
+            let (keepalive, done_rx) = tokio::sync::mpsc::unbounded_channel();
+            (None, done_rx, Some(keepalive))
+        }
     };
 
     let observer = config
@@ -2567,12 +2571,16 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    let mut pool = if config.lazy_pool {
+    let mut pool = if gateway_executor.is_some() {
+        // Gateway mode: the daemon owns worker processes; the local pool
+        // stays empty and is never woken.
+        AgentPool::from_slots(Vec::new())
+    } else if config.lazy_pool {
         AgentPool::from_slots((0..config.agents).map(|_| None).collect())
     } else {
         initialize_agent_pool(&PoolStartup::from_config(&config, observer.clone()), None).await?
     };
-    let mut pool_ready = !config.lazy_pool;
+    let mut pool_ready = gateway_executor.is_some() || !config.lazy_pool;
     let mut pool_lifecycle: PoolLifecycle<AgentPool> = PoolLifecycle::listening();
 
     // Capture a startup watermark BEFORE connecting to the relay. This timestamp
@@ -2837,6 +2845,7 @@ async fn tokio_main() -> Result<()> {
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
+        gateway_executor: gateway_executor.clone(),
     });
 
     if !config.memory_enabled {
@@ -2900,7 +2909,10 @@ async fn tokio_main() -> Result<()> {
     // path. Only meaningful under `lazy_pool`; the tick arm additionally gates
     // on `pool_ready`, so a still-sleeping pool never re-sleeps. Reuses the
     // `last_activity` clock the dispatch path already maintains.
-    let idle_pool_sleep_bound = if config.lazy_pool {
+    // Gateway mode never sleeps/wakes a local pool: re-sleep would reset the
+    // pool to `config.agents` empty slots and the next event would lazily
+    // spawn local ACP agents the gateway backend must never run.
+    let idle_pool_sleep_bound = if config.lazy_pool && gateway_executor.is_none() {
         Duration::from_secs(config.idle_pool_sleep_secs)
     } else {
         Duration::ZERO
@@ -3012,6 +3024,7 @@ async fn tokio_main() -> Result<()> {
     // borrow, yielding a typed enum so the outer code can dispatch cleanly.
     enum PoolEvent {
         Result(Box<PromptResult>),
+        GatewayDone(turn_executor::GatewayTurnDone),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
@@ -3172,6 +3185,9 @@ async fn tokio_main() -> Result<()> {
                         break;
                     }
                 },
+                Some(done) = gateway_done_rx.recv(), if ctx.gateway_executor.is_some() => {
+                    Some(PoolEvent::GatewayDone(done))
+                }
                 // Guard: join_next() returns None immediately when JoinSet is
                 // empty, which would cause a tight spin. Only poll when there
                 // are in-flight tasks.
@@ -3439,11 +3455,27 @@ async fn tokio_main() -> Result<()> {
                                             .await,
                                         &buzz_event.event,
                                     );
-                                    let fired = signal_in_flight_task_for_scope(
-                                        &mut pool,
-                                        &scope,
-                                        ControlSignal::Cancel,
-                                    );
+                                    let fired = if let Some(gateway) =
+                                        ctx.gateway_executor.clone()
+                                    {
+                                        // Gateway turns: cancel the scope's job on
+                                        // the daemon; resolution flows back through
+                                        // the executor's done channel.
+                                        let in_flight = queue.is_scope_in_flight(&scope);
+                                        if in_flight {
+                                            let scope = scope.clone();
+                                            tokio::spawn(async move {
+                                                gateway.cancel_scope(&scope).await;
+                                            });
+                                        }
+                                        in_flight
+                                    } else {
+                                        signal_in_flight_task_for_scope(
+                                            &mut pool,
+                                            &scope,
+                                            ControlSignal::Cancel,
+                                        )
+                                    };
                                     if !fired {
                                         tracing::warn!(
                                             channel_id = %buzz_event.channel_id,
@@ -3795,6 +3827,56 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
+            Some(PoolEvent::GatewayDone(done)) => {
+                // Scope-exact, like the local Result arm: a sibling thread
+                // still running in the same channel keeps its indicator.
+                typing_channels.remove(&done.batch.scope);
+                match &done.outcome {
+                    turn_executor::TurnOutcome::Completed { summary } => {
+                        tracing::info!(
+                            channel = %done.channel_id, turn = %done.turn_id, %summary,
+                            "gateway turn completed"
+                        );
+                    }
+                    turn_executor::TurnOutcome::Canceled => {
+                        tracing::info!(channel = %done.channel_id, "gateway turn canceled");
+                    }
+                    turn_executor::TurnOutcome::Failed { reason } => {
+                        tracing::warn!(channel = %done.channel_id, %reason, "gateway turn failed");
+                        spawn_failure_notice(
+                            Some(&ctx.rest_client),
+                            &done.batch,
+                            format!("⚠️ I couldn't process this: the gateway turn failed ({reason})."),
+                        );
+                    }
+                    turn_executor::TurnOutcome::UnknownOutcome { reason } => {
+                        // Mirrors the gateway's own crash semantics: effects
+                        // may have happened, so the turn is NOT retried.
+                        tracing::warn!(
+                            channel = %done.channel_id, %reason,
+                            "gateway turn outcome unknown — not retried"
+                        );
+                        spawn_failure_notice(
+                            Some(&ctx.rest_client),
+                            &done.batch,
+                            format!(
+                                "⚠️ I can't confirm whether this request completed ({reason}). \
+                                 Please check before re-asking."
+                            ),
+                        );
+                    }
+                }
+                queue.mark_complete(&done.batch.scope);
                 for (scope, thread_tags) in dispatch_pending(
                     &mut pool,
                     &mut queue,
@@ -4426,6 +4508,13 @@ fn dispatch_pending(
     last_activity: &mut tokio::time::Instant,
     observer: Option<&observer::ObserverHandle>,
 ) -> Vec<(scope::SessionScope, ThreadTags)> {
+    if let Some(gateway) = ctx.gateway_executor.as_ref() {
+        let dispatched = dispatch_pending_gateway(gateway, queue);
+        if !dispatched.is_empty() {
+            *last_activity = tokio::time::Instant::now();
+        }
+        return dispatched;
+    }
     // Keyed by the exact session scope, not the channel: two threads dispatching
     // concurrently in one channel get distinct typing entries so completing one
     // never clears the other's indicator.
@@ -4645,6 +4734,42 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
         return false;
     };
     message.contains("Re-authenticate") || message.contains("API Error: 401")
+}
+
+/// Gateway-backend dispatch: flush ready batches straight to the daemon.
+///
+/// No local claim or slot accounting — the gateway owns concurrency caps and
+/// queueing, and the per-channel in-flight lock in `EventQueue` still
+/// guarantees at most one turn per channel here. Completions arrive as
+/// `PoolEvent::GatewayDone` via the executor's done channel.
+fn dispatch_pending_gateway(
+    gateway: &std::sync::Arc<turn_executor::GatewayExecutor>,
+    queue: &mut EventQueue,
+) -> Vec<(scope::SessionScope, ThreadTags)> {
+    let mut dispatched_channels = Vec::new();
+    while let Some(batch) = queue.flush_next() {
+        let channel_id = batch.channel_id;
+        let scope = batch.scope.clone();
+        let typing_scope = batch
+            .events
+            .last()
+            .map(|event| queue::parse_thread_tags(&event.event))
+            .unwrap_or_default();
+        let turn_id = gateway.spawn_turn(batch);
+        tracing::debug!(
+            channel = %channel_id,
+            scope = %scope.telemetry_label(),
+            turn = %turn_id,
+            "gateway_turn_dispatched"
+        );
+        dispatched_channels.push((scope, typing_scope));
+    }
+    tracing::debug!(
+        dispatched = dispatched_channels.len(),
+        queue_depth = queue.pending_channels(),
+        "dispatch_pending_gateway"
+    );
+    dispatched_channels
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.

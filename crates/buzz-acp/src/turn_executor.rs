@@ -52,9 +52,11 @@ pub enum TurnOutcome {
 /// also expressed as an executor. Async-in-trait keeps this simple; the
 /// harness selects a backend at startup, so no trait objects are needed.
 pub trait TurnExecutor: Send + Sync {
+    /// Runs one turn for one session scope (the harness's execution key since
+    /// per-agent ACP session scoping; `Conversation` = the whole channel).
     fn run_turn(
         &self,
-        channel_id: Uuid,
+        scope: &SessionScope,
         turn_id: &str,
         payload: serde_json::Value,
         timeout_ms: Option<i64>,
@@ -72,6 +74,16 @@ pub enum GatewayExecutorError {
     RouteMissing(String),
 }
 
+/// Completion of one gateway-dispatched turn, delivered to the main loop on
+/// the receiver returned by [`GatewayExecutor::connect`].
+pub(crate) struct GatewayTurnDone {
+    pub channel_id: Uuid,
+    pub turn_id: String,
+    pub outcome: TurnOutcome,
+    /// The dispatched batch, kept for failure notices.
+    pub batch: FlushBatch,
+}
+
 /// Turn executor backed by a host agent-gateway daemon.
 pub struct GatewayExecutor {
     client: ControlClient,
@@ -79,35 +91,102 @@ pub struct GatewayExecutor {
     /// turn_id -> gateway job id, for cancellation. Entries are removed when
     /// a turn reaches a terminal outcome.
     jobs: Mutex<HashMap<String, String>>,
+    /// session scope -> in-flight turn_id, for scope-exact `!cancel` routing.
+    in_flight: Mutex<HashMap<SessionScope, String>>,
+    notify: tokio::sync::mpsc::UnboundedSender<GatewayTurnDone>,
 }
 
 impl GatewayExecutor {
     /// Connects, authenticates, and verifies the configured route exists so a
     /// misconfigured socket or missing route fails at startup, not at first
     /// dispatch.
-    pub async fn connect(socket: PathBuf, route_id: String) -> Result<Self, GatewayExecutorError> {
+    pub(crate) async fn connect(
+        socket: PathBuf,
+        route_id: String,
+    ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<GatewayTurnDone>), GatewayExecutorError>
+    {
         let client = ControlClient::connect(Endpoint::Socket(socket)).await?;
         client.status().await?;
         let routes = client.routes().await?;
         if !routes.routes.iter().any(|route| route.id == route_id) {
             return Err(GatewayExecutorError::RouteMissing(route_id));
         }
-        Ok(Self {
-            client,
-            route_id,
-            jobs: Mutex::new(HashMap::new()),
-        })
+        let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok((
+            Self {
+                client,
+                route_id,
+                jobs: Mutex::new(HashMap::new()),
+                in_flight: Mutex::new(HashMap::new()),
+                notify,
+            },
+            done_rx,
+        ))
     }
 
     pub fn route_id(&self) -> &str {
         &self.route_id
+    }
+
+    /// Fire-and-forget dispatch of one flushed batch; completion arrives on
+    /// the receiver returned by `connect`. Returns the turn id.
+    pub(crate) fn spawn_turn(self: &std::sync::Arc<Self>, batch: FlushBatch) -> String {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let payload = encode_turn_payload(&batch);
+        let executor = std::sync::Arc::clone(self);
+        let id = turn_id.clone();
+        tokio::spawn(async move {
+            let channel_id = batch.channel_id;
+            let scope = batch.scope.clone();
+            executor
+                .in_flight
+                .lock()
+                .await
+                .insert(scope.clone(), id.clone());
+            let outcome = executor.run_turn(&scope, &id, payload, None).await;
+            executor.in_flight.lock().await.remove(&scope);
+            let _ = executor.notify.send(GatewayTurnDone {
+                channel_id,
+                turn_id: id,
+                outcome,
+                batch,
+            });
+        });
+        turn_id
+    }
+
+    /// `!cancel` entry point: cancels the scope's in-flight gateway turn, if
+    /// any (scope-exact, so a sibling thread in the same channel keeps
+    /// running). Completion still arrives through the done channel (the job
+    /// resolves to canceled/reconciling and the poll loop reports it).
+    pub(crate) async fn cancel_scope(&self, scope: &SessionScope) -> bool {
+        let turn = self.in_flight.lock().await.get(scope).cloned();
+        match turn {
+            Some(turn_id) => self.cancel_turn(&turn_id).await,
+            None => false,
+        }
+    }
+}
+
+/// Gateway thread id for a session scope. The gateway keys worker/session
+/// affinity on (agent, context, thread): a conversation scope is the channel
+/// itself (the pre-scoping behaviour, unchanged under the default channel
+/// session policy); a thread scope gets its own gateway session so sibling
+/// threads never share one ACP session.
+pub(crate) fn gateway_thread_id(scope: &SessionScope) -> String {
+    match scope {
+        SessionScope::Conversation { channel_id } => channel_id.to_string(),
+        SessionScope::Thread {
+            channel_id,
+            root_event_id,
+        } => format!("{channel_id}:{root_event_id}"),
     }
 }
 
 impl TurnExecutor for GatewayExecutor {
     async fn run_turn(
         &self,
-        channel_id: Uuid,
+        scope: &SessionScope,
         turn_id: &str,
         payload: serde_json::Value,
         timeout_ms: Option<i64>,
@@ -116,7 +195,7 @@ impl TurnExecutor for GatewayExecutor {
             route_id: Some(self.route_id.clone()),
             agent_id: None,
             context_id: None,
-            thread_id: Some(channel_id.to_string()),
+            thread_id: Some(gateway_thread_id(scope)),
             task: payload.to_string(),
             permission_profile: None,
             // Agent turns publish to the relay: real external effects, never
@@ -186,9 +265,6 @@ impl TurnExecutor for GatewayExecutor {
 /// Wire form of one turn: the raw queued relay events for a channel. The GWP
 /// worker rebuilds a [`FlushBatch`] from this and runs the same prompt
 /// assembly as the local pool, so prompt semantics never fork.
-// Consumed by the north-side dispatch wiring (next change); the roundtrip
-// test below keeps it honest until then.
-#[allow(dead_code)]
 pub(crate) fn encode_turn_payload(batch: &FlushBatch) -> serde_json::Value {
     fn event(entry: &BatchEvent) -> serde_json::Value {
         serde_json::json!({"event": entry.event, "prompt_tag": entry.prompt_tag})
@@ -331,6 +407,25 @@ mod tests {
             SessionScope::Conversation {
                 channel_id: channel
             }
+        );
+    }
+
+    #[test]
+    fn gateway_thread_ids_follow_the_session_scope() {
+        let channel = Uuid::new_v4();
+        assert_eq!(
+            gateway_thread_id(&SessionScope::Conversation {
+                channel_id: channel
+            }),
+            channel.to_string()
+        );
+        let root = "cd".repeat(32);
+        assert_eq!(
+            gateway_thread_id(&SessionScope::Thread {
+                channel_id: channel,
+                root_event_id: root.clone()
+            }),
+            format!("{channel}:{root}")
         );
     }
 
