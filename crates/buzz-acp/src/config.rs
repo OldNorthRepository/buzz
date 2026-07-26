@@ -49,6 +49,49 @@ pub enum ConfigError {
 
     #[error("config file error: {0}")]
     ConfigFile(String),
+
+    #[error("gateway backend error: {0}")]
+    Gateway(String),
+}
+
+/// Where a turn actually executes.
+#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum ExecutionBackend {
+    /// Today's in-process ACP subprocess pool.
+    Local,
+    /// Submit turns as jobs to a host agent-gateway daemon (spike; see
+    /// `turn_executor`).
+    Gateway,
+}
+
+/// Resolved settings for `ExecutionBackend::Gateway`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayBackendConfig {
+    /// Unix socket of the agent-gateway control API.
+    pub socket: PathBuf,
+    /// Gateway route this harness submits turns to.
+    pub route_id: String,
+}
+
+/// `--backend gateway` is only coherent with both a socket and a route; the
+/// gateway derives agent/context identity from the route, so a missing half
+/// must fail configuration rather than silently running the local pool.
+pub fn resolve_gateway_backend(
+    backend: ExecutionBackend,
+    socket: Option<PathBuf>,
+    route_id: Option<String>,
+) -> Result<Option<GatewayBackendConfig>, ConfigError> {
+    match backend {
+        ExecutionBackend::Local => Ok(None),
+        ExecutionBackend::Gateway => match (socket, route_id) {
+            (Some(socket), Some(route_id)) if !route_id.trim().is_empty() => {
+                Ok(Some(GatewayBackendConfig { socket, route_id }))
+            }
+            _ => Err(ConfigError::Gateway(
+                "backend=gateway requires both --gateway-socket and --gateway-route".into(),
+            )),
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -495,6 +538,19 @@ pub struct CliArgs {
         default_value_t = DEFAULT_WARM_IDLE_SECONDS
     )]
     pub warm_idle_seconds: u64,
+
+    /// Execution backend: `local` (in-process ACP subprocess pool) or
+    /// `gateway` (submit turns as jobs to a host agent-gateway daemon).
+    #[arg(long, env = "BUZZ_ACP_BACKEND", value_enum, default_value_t = ExecutionBackend::Local)]
+    pub backend: ExecutionBackend,
+
+    /// Unix socket of the agent-gateway control API (backend = gateway).
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_SOCKET")]
+    pub gateway_socket: Option<PathBuf>,
+
+    /// Gateway route id this harness submits turns to (backend = gateway).
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_ROUTE")]
+    pub gateway_route: Option<String>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -574,6 +630,9 @@ pub struct Config {
     pub lazy_pool: bool,
     /// Duration idle adapters remain warm before the pool contracts to zero.
     pub warm_idle_seconds: u64,
+    /// Gateway execution backend, when `--backend gateway` is configured.
+    /// `None` = local pool (today's behavior).
+    pub gateway: Option<GatewayBackendConfig>,
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
@@ -1123,6 +1182,11 @@ impl Config {
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             warm_idle_seconds: args.warm_idle_seconds,
+            gateway: resolve_gateway_backend(
+                args.backend,
+                args.gateway_socket.clone(),
+                args.gateway_route.clone(),
+            )?,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -1495,6 +1559,7 @@ mod tests {
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             warm_idle_seconds: DEFAULT_WARM_IDLE_SECONDS,
+            gateway: None,
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
@@ -2991,3 +3056,67 @@ channels = "ALL"
         );
     }
 }
+
+#[cfg(test)]
+mod gateway_backend_tests {
+    use super::*;
+
+    #[test]
+    fn local_backend_ignores_gateway_settings() {
+        assert_eq!(
+            resolve_gateway_backend(ExecutionBackend::Local, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_gateway_backend(
+                ExecutionBackend::Local,
+                Some(PathBuf::from("/tmp/sock")),
+                Some("route".into())
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_backend_requires_socket_and_route() {
+        assert!(resolve_gateway_backend(ExecutionBackend::Gateway, None, None).is_err());
+        assert!(
+            resolve_gateway_backend(
+                ExecutionBackend::Gateway,
+                Some(PathBuf::from("/run/gw.sock")),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_gateway_backend(ExecutionBackend::Gateway, None, Some("route".into()))
+                .is_err()
+        );
+        assert!(
+            resolve_gateway_backend(
+                ExecutionBackend::Gateway,
+                Some(PathBuf::from("/run/gw.sock")),
+                Some("  ".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gateway_backend_resolves_with_both_halves() {
+        let resolved = resolve_gateway_backend(
+            ExecutionBackend::Gateway,
+            Some(PathBuf::from("/run/agent-gateway/control.sock")),
+            Some("buzz-agent-main".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.route_id, "buzz-agent-main");
+        assert_eq!(
+            resolved.socket,
+            PathBuf::from("/run/agent-gateway/control.sock")
+        );
+    }
+}
+
