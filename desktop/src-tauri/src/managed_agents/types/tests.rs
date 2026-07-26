@@ -51,6 +51,10 @@ fn managed_agent_record_without_auth_tag_deserializes() {
     assert_eq!(record.auth_tag, None);
     assert_eq!(record.avatar_url, None);
     assert_eq!(record.pubkey, "abcd1234");
+    assert!(
+        record.start_on_app_launch,
+        "a missing field in an existing persisted record keeps the historical policy"
+    );
 }
 
 /// Agent records WITH an auth_tag round-trip correctly through serde.
@@ -272,6 +276,24 @@ fn create_request_deserializes_camel_case_relay_mesh() {
             model_ref: "Qwen3".to_string()
         })
     );
+}
+
+#[test]
+fn new_agent_create_request_is_not_auto_started_without_explicit_opt_in() {
+    let request: CreateManagedAgentRequest =
+        serde_json::from_str(r#"{"name": "repository-agent"}"#)
+            .expect("minimal create request must deserialize");
+
+    assert!(
+        !request.start_on_app_launch,
+        "new repository agents must not implicitly fan out on app launch"
+    );
+
+    let explicit: CreateManagedAgentRequest = serde_json::from_str(
+        r#"{"name": "control-agent", "startOnAppLaunch": true}"#,
+    )
+    .expect("explicit launch policy must deserialize");
+    assert!(explicit.start_on_app_launch);
 }
 
 /// Persisted records use snake_case; the camelCase alias must not break

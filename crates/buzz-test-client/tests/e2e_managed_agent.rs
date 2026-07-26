@@ -52,7 +52,7 @@ fn agent_projection_content(name: &str) -> String {
         "system_prompt": "You are a test agent.",
         "model": "claude-opus-4",
         "provider": "anthropic",
-        "parallelism": 24,
+        "parallelism": 1,
         "respond_to": "allowlist",
         "respond_to_allowlist": ["79be667e"]
     })
@@ -70,7 +70,7 @@ fn legacy_fat_agent_projection_content(name: &str) -> String {
         "model": "claude-opus-4",
         "provider": "anthropic",
         "persona_source_version": "abc123",
-        "parallelism": 24,
+        "parallelism": 1,
         "respond_to": "allowlist",
         "respond_to_allowlist": ["79be667e"]
     })
