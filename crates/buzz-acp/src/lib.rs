@@ -66,6 +66,10 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// strand a slot in `respawn_in_flight` or prevent harness shutdown.
 const AGENT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Respawn tasks are cancellation-aware, but retain a global backstop so a
+/// shutdown can never wait forever for a misbehaving runtime or OS primitive.
+const RESPAWN_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -1390,6 +1394,26 @@ async fn evict_expired_idle_workers(
         agent.acp.shutdown().await;
     }
     evicted
+}
+
+/// Wait for a crash-recovery backoff unless shutdown arrives first.
+///
+/// Returning `false` means the caller must not spawn a replacement. This is
+/// intentionally separate from `spawn_and_init`: crash recovery has a delay,
+/// while demand wakeups start immediately.
+async fn wait_for_respawn_delay(delay: Duration, shutdown: &mut watch::Receiver<()>) -> bool {
+    if delay.is_zero() {
+        return !shutdown.has_changed().unwrap_or(true);
+    }
+
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            let _ = changed;
+            false
+        }
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 /// Task resources shared by demand-driven cold starts.
@@ -2770,7 +2794,7 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                if handle_prompt_result_with_shutdown(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -2780,6 +2804,7 @@ async fn tokio_main() -> Result<()> {
                     &mut crash_history,
                     &respawn_tx,
                     &mut respawn_tasks,
+                    Some(shutdown_rx.clone()),
                     observer.clone(),
                     Some(&ctx.rest_client),
                 ) == LoopAction::Exit
@@ -2796,6 +2821,7 @@ async fn tokio_main() -> Result<()> {
                     &mut crash_history,
                     &respawn_tx,
                     &mut respawn_tasks,
+                    shutdown_rx.clone(),
                     observer.clone(),
                 ) == LoopAction::Exit
                 {
@@ -2809,7 +2835,7 @@ async fn tokio_main() -> Result<()> {
             }
             Some(PoolEvent::Panic(join_error)) => {
                 tracing::error!("agent task panicked: {join_error}");
-                recover_panicked_agent(
+                recover_panicked_agent_with_shutdown(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -2820,6 +2846,7 @@ async fn tokio_main() -> Result<()> {
                     &mut crash_history,
                     &respawn_tx,
                     &mut respawn_tasks,
+                    Some(shutdown_rx.clone()),
                     observer.clone(),
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
@@ -3099,15 +3126,27 @@ async fn tokio_main() -> Result<()> {
     }
     drop(pool);
 
-    // Drain respawn tasks instead of aborting them. `spawn_and_init` bounds
-    // every initialize handshake, and demand wakes also observe the shutdown
-    // watch, so this finishes with an explicit `AcpClient::shutdown()` rather
-    // than dropping a just-spawned child to best-effort cleanup.
-    while respawn_tasks.join_next().await.is_some() {}
+    // Every respawn path watches shutdown during backoff and initialization,
+    // so this normally drains promptly and lets each task explicitly reap any
+    // child it owns. Keep one global ceiling across *all* crash and demand
+    // respawns: a wedged runtime must not make process shutdown unbounded.
+    let respawn_drain = tokio::time::timeout(RESPAWN_SHUTDOWN_DRAIN_TIMEOUT, async {
+        while respawn_tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if respawn_drain.is_err() {
+        tracing::warn!(
+            timeout = ?RESPAWN_SHUTDOWN_DRAIN_TIMEOUT,
+            "respawn tasks exceeded shutdown drain deadline — aborting"
+        );
+        respawn_tasks.shutdown().await;
+    }
 
-    // Drain returned agents with explicit shutdown rather than relying on
-    // AcpClient::Drop.
+    // Each task sends exactly one guarded result, including cancellation, so
+    // clear its slot state while explicitly reaping every successfully
+    // initialized child instead of relying on `AcpClient::Drop`.
     while let Ok(rr) = respawn_rx.try_recv() {
+        crash_history[rr.index].respawn_in_flight = false;
         if let Ok((mut acp, _, _)) = rr.result {
             acp.shutdown().await;
             tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
@@ -3475,8 +3514,39 @@ fn spawn_failure_notice(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    result: PromptResult,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+    rest_client: Option<&relay::RestClient>,
+) -> LoopAction {
+    handle_prompt_result_with_shutdown(
+        pool,
+        queue,
+        config,
+        result,
+        heartbeat_in_flight,
+        removed_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        None,
+        observer,
+        rest_client,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_prompt_result_with_shutdown(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     config: &Config,
@@ -3486,6 +3556,7 @@ fn handle_prompt_result(
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    shutdown: Option<watch::Receiver<()>>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
 ) -> LoopAction {
@@ -3714,6 +3785,7 @@ fn handle_prompt_result(
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
+                shutdown.clone(),
                 observer.clone(),
             ) {
                 // Circuit open — slot stays empty until maintenance refill.
@@ -3754,6 +3826,7 @@ fn handle_prompt_result(
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
+                shutdown.clone(),
                 observer.clone(),
             ) {
                 // Circuit open — slot stays empty until maintenance refill.
@@ -3819,6 +3892,7 @@ fn handle_prompt_result(
                     slot_history,
                     respawn_tx,
                     respawn_tasks,
+                    shutdown,
                     observer,
                 ) && pool.live_count() == 0
                     && !any_respawn_in_flight(crash_history)
@@ -3843,6 +3917,7 @@ fn handle_prompt_result(
     LoopAction::Continue
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn recover_panicked_agent(
     pool: &mut AgentPool,
@@ -3855,6 +3930,37 @@ fn recover_panicked_agent(
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) {
+    recover_panicked_agent_with_shutdown(
+        pool,
+        queue,
+        config,
+        join_error,
+        heartbeat_in_flight,
+        removed_channels,
+        typing_channels,
+        crash_history,
+        respawn_tx,
+        respawn_tasks,
+        None,
+        observer,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_panicked_agent_with_shutdown(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    config: &Config,
+    join_error: tokio::task::JoinError,
+    heartbeat_in_flight: &mut bool,
+    removed_channels: &HashSet<Uuid>,
+    typing_channels: &mut HashMap<Uuid, ThreadTags>,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    shutdown: Option<watch::Receiver<()>>,
     observer: Option<observer::ObserverHandle>,
 ) {
     let task_id = join_error.id();
@@ -3934,10 +4040,23 @@ fn recover_panicked_agent(
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer, None).await;
+        let result = match shutdown {
+            Some(mut shutdown) => {
+                if wait_for_respawn_delay(delay, &mut shutdown).await {
+                    spawn_and_init(&cmd, &args, &env, has_codex, i, observer, Some(shutdown)).await
+                } else {
+                    Err(anyhow::anyhow!(
+                        "agent respawn cancelled by shutdown during backoff"
+                    ))
+                }
+            }
+            None => {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                spawn_and_init(&cmd, &args, &env, has_codex, i, observer, None).await
+            }
+        };
         guard.send(result);
     });
 }
@@ -3953,12 +4072,13 @@ fn drain_ready_join_results(
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    shutdown: watch::Receiver<()>,
     observer: Option<observer::ObserverHandle>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
             tracing::error!("agent task panicked: {join_error}");
-            recover_panicked_agent(
+            recover_panicked_agent_with_shutdown(
                 pool,
                 queue,
                 config,
@@ -3969,6 +4089,7 @@ fn drain_ready_join_results(
                 crash_history,
                 respawn_tx,
                 respawn_tasks,
+                Some(shutdown.clone()),
                 observer.clone(),
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
@@ -4099,6 +4220,7 @@ fn spawn_respawn_task(
     slot: &mut SlotCircuit,
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    shutdown: Option<watch::Receiver<()>>,
     observer: Option<observer::ObserverHandle>,
 ) -> bool {
     let index = old_agent.index;
@@ -4128,16 +4250,38 @@ fn spawn_respawn_task(
     let has_codex = config.has_generated_codex_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
-        // Shutdown old agent (reap child, prevent zombie).
+        // Shutdown old agent before observing cancellation so its child is
+        // always reaped, even when the harness is already stopping.
         let mut agent = old_agent;
         agent.acp.shutdown().await;
         drop(agent);
 
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer, None).await;
+        let result = match shutdown {
+            Some(mut shutdown) => {
+                if wait_for_respawn_delay(delay, &mut shutdown).await {
+                    spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        index,
+                        observer,
+                        Some(shutdown),
+                    )
+                    .await
+                } else {
+                    Err(anyhow::anyhow!(
+                        "agent respawn cancelled by shutdown during backoff"
+                    ))
+                }
+            }
+            None => {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                spawn_and_init(&cmd, &args, &env, has_codex, index, observer, None).await
+            }
+        };
         guard.send(result);
     });
 
@@ -6708,9 +6852,16 @@ mod error_outcome_emission_tests {
         let (mut acp, _, _) = second.result.expect("post-contraction adapter initializes");
         acp.shutdown().await;
 
-        // A silent adapter cannot strand the in-flight guard during shutdown;
-        // the wake observes the watch signal and explicitly reaps its child.
-        config.agent_args = vec!["-c".into(), "read _; sleep 30".into()];
+        // A silent adapter cannot strand the in-flight guard during shutdown.
+        // Wait until the child has entered initialize before signalling so this
+        // exercises cancellation of a real, already-spawned adapter.
+        let init_marker = std::env::temp_dir().join(format!("buzz-acp-init-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&init_marker);
+        config.agent_args = vec![
+            "-c".into(),
+            format!("echo $$ > {}; read _; sleep 30", init_marker.display()),
+        ];
+        let init_marker_wait = init_marker.clone();
         let mut demand_spawn = DemandSpawnContext {
             tx: &respawn_tx,
             tasks: &mut respawn_tasks,
@@ -6724,6 +6875,13 @@ mod error_outcome_emission_tests {
             &mut demand_spawn,
             None,
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !init_marker_wait.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cold wake must enter initialization before shutdown");
         shutdown_tx.send(()).expect("wake still observes shutdown");
         let cancelled = tokio::time::timeout(Duration::from_secs(2), respawn_rx.recv())
             .await
@@ -6736,6 +6894,69 @@ mod error_outcome_emission_tests {
             "shutdown completion releases the global cold-wake guard"
         );
         while respawn_tasks.join_next().await.is_some() {}
+        #[cfg(unix)]
+        {
+            let init_pid = std::fs::read_to_string(&init_marker)
+                .expect("initializing child records its pid")
+                .trim()
+                .parse::<i32>()
+                .expect("recorded pid is numeric");
+            assert!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(init_pid), None).is_err(),
+                "shutdown must reap the initializing child"
+            );
+        }
+        let _ = std::fs::remove_file(init_marker);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_crash_respawn_backoff_without_spawning_a_replacement() {
+        let mut config = test_config();
+        let spawn_marker =
+            std::env::temp_dir().join(format!("buzz-acp-respawn-{}", Uuid::new_v4()));
+        let _ = std::fs::remove_file(&spawn_marker);
+        config.agent_command = "sh".into();
+        config.agent_args = vec!["-c".into(), format!("touch {}", spawn_marker.display())];
+
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        };
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(1);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+
+        assert!(spawn_respawn_task(
+            dummy_agent(0).await,
+            &config,
+            &mut slot,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(shutdown_rx),
+            None,
+        ));
+        assert!(slot.respawn_in_flight);
+        shutdown_tx
+            .send(())
+            .expect("respawn task retains shutdown receiver");
+
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), respawn_rx.recv())
+            .await
+            .expect("shutdown must interrupt crash backoff")
+            .expect("respawn guard must report cancellation");
+        slot.respawn_in_flight = false;
+        assert!(cancelled.result.is_err());
+        assert!(
+            !slot.respawn_in_flight,
+            "cancellation clears the slot guard"
+        );
+        assert!(
+            !spawn_marker.exists(),
+            "shutdown during backoff must not launch a replacement child"
+        );
+        while respawn_tasks.join_next().await.is_some() {}
+        let _ = std::fs::remove_file(spawn_marker);
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how

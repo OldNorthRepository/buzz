@@ -429,8 +429,11 @@ impl AcpClient {
                 match tokio::time::timeout(GRACEFUL_SHUTDOWN_GRACE, self.child.wait()).await {
                     Ok(Ok(_)) => return,
                     Ok(Err(e)) => {
-                        tracing::debug!("child wait error after SIGTERM: {e}");
-                        return;
+                        // A wait error is not evidence that the child was
+                        // reaped. Fall through to SIGKILL + a second bounded
+                        // wait rather than letting an uncertain child escape
+                        // the explicit cleanup path.
+                        tracing::warn!("child wait error after SIGTERM; force-killing: {e}");
                     }
                     Err(_) => {
                         tracing::warn!("child ignored SIGTERM grace period; force-killing");
@@ -2286,6 +2289,50 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_escalates_from_term_to_kill_and_reaps() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let marker = std::env::temp_dir().join(format!("buzz-acp-term-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_file(&marker);
+        let args = vec![
+            "-c".into(),
+            format!(
+                "trap '' TERM; echo ready > {}; while :; do sleep 1; done",
+                marker.display()
+            ),
+        ];
+        let mut client = AcpClient::spawn("sh", &args, &[], false)
+            .await
+            .expect("spawn TERM-ignoring adapter");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adapter must install its TERM trap before shutdown");
+
+        let started = std::time::Instant::now();
+        client.shutdown().await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(4),
+            "TERM-ignoring child must receive the configured graceful window before KILL"
+        );
+        let status = client
+            .child
+            .try_wait()
+            .expect("read reaped child status")
+            .expect("shutdown must reap the direct child");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "TERM-ignoring process must be escalated to SIGKILL"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
 
     #[test]
     fn stop_reason_parses_all_known_values() {
