@@ -567,6 +567,9 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Gateway execution backend. When set, `dispatch_pending` routes turns
+    /// to the agent-gateway daemon instead of claiming a local pool slot.
+    pub gateway_executor: Option<std::sync::Arc<crate::turn_executor::GatewayExecutor>>,
 }
 
 impl AgentPool {
@@ -6576,6 +6579,7 @@ mod tests {
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            gateway_executor: None,
         }
     }
 

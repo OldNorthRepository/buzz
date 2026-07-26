@@ -1160,6 +1160,25 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
+        let gateway = resolve_gateway_backend(
+            args.backend,
+            args.gateway_socket.clone(),
+            args.gateway_route.clone(),
+        )?;
+        // GWP/0 has no mid-turn channel, so steer/interrupt cannot reach a
+        // gateway turn. Force queue-mode handling rather than silently
+        // accepting a mode the backend cannot honor (steering returns with
+        // GWP/1).
+        if gateway.is_some()
+            && args.multiple_event_handling != MultipleEventHandling::Queue
+        {
+            tracing::warn!(
+                "backend=gateway forces --multiple-event-handling=queue \
+                 (steer/interrupt require a mid-turn channel the gateway does not have yet)"
+            );
+            args.multiple_event_handling = MultipleEventHandling::Queue;
+        }
+
         let config = Config {
             keys,
             relay_url: args.relay_url,
@@ -1209,11 +1228,7 @@ impl Config {
             lazy_pool: args.lazy_pool,
             warm_idle_seconds: args.warm_idle_seconds,
             gwp_worker: args.gwp_worker,
-            gateway: resolve_gateway_backend(
-                args.backend,
-                args.gateway_socket.clone(),
-                args.gateway_route.clone(),
-            )?,
+            gateway,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
@@ -3128,6 +3143,33 @@ mod gateway_backend_tests {
                 Some("  ".into())
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn gateway_backend_forces_queue_mode() {
+        use clap::Parser;
+        let keys = nostr::Keys::generate();
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            &keys.secret_key().to_secret_hex(),
+            "--backend",
+            "gateway",
+            "--gateway-socket",
+            "/tmp/gw.sock",
+            "--gateway-route",
+            "r1",
+            "--multiple-event-handling",
+            "steer",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.gateway.is_some());
+        assert_eq!(
+            config.multiple_event_handling,
+            MultipleEventHandling::Queue,
+            "steer cannot reach a gateway turn; queue mode must be forced"
         );
     }
 
