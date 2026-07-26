@@ -65,29 +65,88 @@ pub enum ExecutionBackend {
 pub struct GatewayBackendConfig {
     /// Unix socket of the agent-gateway control API.
     pub socket: PathBuf,
-    /// Gateway route this harness submits turns to.
+    /// Default route for channels with no explicit or auto mapping.
     pub route_id: String,
+    /// Explicit channel -> route overrides. Highest priority.
+    pub channel_routes: std::collections::HashMap<uuid::Uuid, String>,
+    /// Name-convention auto-routing, when enabled.
+    pub auto_route: Option<AutoRouteConfig>,
+}
+
+/// A channel named `foo` maps to workspace `<root>/foo` (when the directory
+/// exists) under a route the harness creates on demand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoRouteConfig {
+    pub root: PathBuf,
+    pub runtime: String,
 }
 
 /// `--backend gateway` is only coherent with both a socket and a route; the
 /// gateway derives agent/context identity from the route, so a missing half
 /// must fail configuration rather than silently running the local pool.
-pub fn resolve_gateway_backend(
+pub fn resolve_gateway_backend_full(
     backend: ExecutionBackend,
     socket: Option<PathBuf>,
     route_id: Option<String>,
+    channel_route_pairs: &[String],
+    auto_root: Option<PathBuf>,
+    auto_runtime: Option<String>,
 ) -> Result<Option<GatewayBackendConfig>, ConfigError> {
-    match backend {
-        ExecutionBackend::Local => Ok(None),
-        ExecutionBackend::Gateway => match (socket, route_id) {
-            (Some(socket), Some(route_id)) if !route_id.trim().is_empty() => {
-                Ok(Some(GatewayBackendConfig { socket, route_id }))
-            }
-            _ => Err(ConfigError::Gateway(
-                "backend=gateway requires both --gateway-socket and --gateway-route".into(),
-            )),
-        },
+    if backend == ExecutionBackend::Local {
+        return Ok(None);
     }
+    let (Some(socket), Some(route_id)) = (socket, route_id.filter(|r| !r.trim().is_empty())) else {
+        return Err(ConfigError::Gateway(
+            "backend=gateway requires both --gateway-socket and --gateway-route".into(),
+        ));
+    };
+    let mut channel_routes = std::collections::HashMap::new();
+    for pair in channel_route_pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (channel, route) = pair.split_once('=').ok_or_else(|| {
+            ConfigError::Gateway(format!(
+                "--gateway-routes entry '{pair}' is not <channel-uuid>=<route-id>"
+            ))
+        })?;
+        let channel = uuid::Uuid::parse_str(channel.trim())
+            .map_err(|_| ConfigError::Gateway(format!("'{channel}' is not a channel uuid")))?;
+        if route.trim().is_empty() {
+            return Err(ConfigError::Gateway(format!(
+                "--gateway-routes entry for {channel} has an empty route id"
+            )));
+        }
+        channel_routes.insert(channel, route.trim().to_owned());
+    }
+    let auto_route = match (auto_root, auto_runtime) {
+        (Some(root), Some(runtime)) if !runtime.trim().is_empty() => {
+            if !root.is_absolute() {
+                return Err(ConfigError::Gateway(
+                    "--gateway-auto-route-root must be an absolute path".into(),
+                ));
+            }
+            Some(AutoRouteConfig {
+                root,
+                runtime: runtime.trim().to_owned(),
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(ConfigError::Gateway(
+                "auto-routing requires both --gateway-auto-route-root and \
+                 --gateway-auto-route-runtime"
+                    .into(),
+            ));
+        }
+    };
+    Ok(Some(GatewayBackendConfig {
+        socket,
+        route_id,
+        channel_routes,
+        auto_route,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -540,6 +599,20 @@ pub struct CliArgs {
     /// Gateway route id this harness submits turns to (backend = gateway).
     #[arg(long, env = "BUZZ_ACP_GATEWAY_ROUTE")]
     pub gateway_route: Option<String>,
+
+    /// Per-channel route overrides: `<channel-uuid>=<route-id>` pairs.
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_ROUTES", value_delimiter = ',')]
+    pub gateway_routes: Vec<String>,
+
+    /// Auto-route root: a channel named `foo` maps to `<root>/foo` when that
+    /// directory exists, and the harness creates gateway route `ch-foo` for
+    /// it on demand. Requires --gateway-auto-route-runtime.
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_AUTO_ROUTE_ROOT")]
+    pub gateway_auto_route_root: Option<PathBuf>,
+
+    /// Gateway runtime used for auto-created channel routes.
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_AUTO_ROUTE_RUNTIME")]
+    pub gateway_auto_route_runtime: Option<String>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -1043,18 +1116,19 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
-        let gateway = resolve_gateway_backend(
+        let gateway = resolve_gateway_backend_full(
             args.backend,
             args.gateway_socket.clone(),
             args.gateway_route.clone(),
+            &args.gateway_routes,
+            args.gateway_auto_route_root.clone(),
+            args.gateway_auto_route_runtime.clone(),
         )?;
         // GWP/0 has no mid-turn channel, so steer/interrupt cannot reach a
         // gateway turn. Force queue-mode handling rather than silently
         // accepting a mode the backend cannot honor (steering returns with
         // GWP/1).
-        if gateway.is_some()
-            && args.multiple_event_handling != MultipleEventHandling::Queue
-        {
+        if gateway.is_some() && args.multiple_event_handling != MultipleEventHandling::Queue {
             tracing::warn!(
                 "backend=gateway forces --multiple-event-handling=queue \
                  (steer/interrupt require a mid-turn channel the gateway does not have yet)"
@@ -2823,14 +2897,18 @@ mod gateway_backend_tests {
     #[test]
     fn local_backend_ignores_gateway_settings() {
         assert_eq!(
-            resolve_gateway_backend(ExecutionBackend::Local, None, None).unwrap(),
+            resolve_gateway_backend_full(ExecutionBackend::Local, None, None, &[], None, None)
+                .unwrap(),
             None
         );
         assert_eq!(
-            resolve_gateway_backend(
+            resolve_gateway_backend_full(
                 ExecutionBackend::Local,
                 Some(PathBuf::from("/tmp/sock")),
-                Some("route".into())
+                Some("route".into()),
+                &[],
+                None,
+                None,
             )
             .unwrap(),
             None
@@ -2839,26 +2917,116 @@ mod gateway_backend_tests {
 
     #[test]
     fn gateway_backend_requires_socket_and_route() {
-        assert!(resolve_gateway_backend(ExecutionBackend::Gateway, None, None).is_err());
-        assert!(
-            resolve_gateway_backend(
-                ExecutionBackend::Gateway,
-                Some(PathBuf::from("/run/gw.sock")),
-                None
-            )
-            .is_err()
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            None,
+            None,
+            &[],
+            None,
+            None
+        )
+        .is_err());
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            Some(PathBuf::from("/run/gw.sock")),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .is_err());
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            None,
+            Some("route".into()),
+            &[],
+            None,
+            None
+        )
+        .is_err());
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            Some(PathBuf::from("/run/gw.sock")),
+            Some("  ".into()),
+            &[],
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn channel_route_pairs_parse_and_validate() {
+        let channel = uuid::Uuid::new_v4();
+        let config = resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            Some(PathBuf::from("/run/gw.sock")),
+            Some("default".into()),
+            &[format!("{channel}=kanban-route"), " ".into()],
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.channel_routes.get(&channel).map(String::as_str),
+            Some("kanban-route")
         );
-        assert!(
-            resolve_gateway_backend(ExecutionBackend::Gateway, None, Some("route".into()))
-                .is_err()
-        );
-        assert!(
-            resolve_gateway_backend(
-                ExecutionBackend::Gateway,
-                Some(PathBuf::from("/run/gw.sock")),
-                Some("  ".into())
-            )
-            .is_err()
+
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            Some(PathBuf::from("/run/gw.sock")),
+            Some("default".into()),
+            &["not-a-uuid=route".into()],
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn auto_routing_requires_root_and_runtime_together() {
+        let sock = || Some(PathBuf::from("/run/gw.sock"));
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            sock(),
+            Some("d".into()),
+            &[],
+            Some(PathBuf::from("/home/x/code")),
+            None,
+        )
+        .is_err());
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            sock(),
+            Some("d".into()),
+            &[],
+            None,
+            Some("rt".into()),
+        )
+        .is_err());
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            sock(),
+            Some("d".into()),
+            &[],
+            Some(PathBuf::from("relative")),
+            Some("rt".into()),
+        )
+        .is_err());
+        let config = resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            sock(),
+            Some("d".into()),
+            &[],
+            Some(PathBuf::from("/home/x/code")),
+            Some("rt".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            config.auto_route.as_ref().map(|a| a.runtime.as_str()),
+            Some("rt")
         );
     }
 
@@ -2891,10 +3059,13 @@ mod gateway_backend_tests {
 
     #[test]
     fn gateway_backend_resolves_with_both_halves() {
-        let resolved = resolve_gateway_backend(
+        let resolved = resolve_gateway_backend_full(
             ExecutionBackend::Gateway,
             Some(PathBuf::from("/run/agent-gateway/control.sock")),
             Some("buzz-agent-main".into()),
+            &[],
+            None,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2905,4 +3076,3 @@ mod gateway_backend_tests {
         );
     }
 }
-

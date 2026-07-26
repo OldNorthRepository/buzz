@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -28,9 +28,9 @@ use nostr::ToBech32;
 
 use crate::config::Config;
 use crate::pool::{self, OwnedAgent, PromptContext, PromptOutcome, PromptResult};
-use crate::relay::{RestClient, relay_ws_to_http};
+use crate::relay::{relay_ws_to_http, RestClient};
 use crate::turn_executor::decode_turn_payload;
-use crate::{PoolStartup, build_mcp_servers, initialize_agent_pool};
+use crate::{build_mcp_servers, initialize_agent_pool, PoolStartup};
 
 pub async fn run(mut config: Config) -> anyhow::Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -145,7 +145,10 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let task = frame.get("task").and_then(Value::as_str).unwrap_or_default();
+                let task = frame
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let batch = match decode_turn_payload(task) {
                     Ok(batch) => batch,
                     Err(reason) => {
