@@ -1730,13 +1730,14 @@ async fn tokio_main() -> Result<()> {
     // CIRCUIT_BREAKER_WINDOW on each respawn attempt. The Vec is indexed by
     // agent slot index, so it must be sized to the configured pool capacity
     // (not the live count, which may be smaller after partial startup).
-    let mut crash_history: Vec<SlotCircuit> = (0..config.agents as usize)
-        .map(|_| SlotCircuit {
-            crash_times: Vec::new(),
-            open_until: None,
-            respawn_in_flight: false,
-        })
-        .collect();
+    let mut crash_history: Vec<SlotCircuit> =
+        (0..local_slot_count(config.agents, gateway_executor.is_some()))
+            .map(|_| SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            })
+            .collect();
 
     //
     // Branches 1 & 2 both need to borrow `pool`, but they access different
@@ -2993,6 +2994,36 @@ fn try_native_steer(
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
 /// Flush queued work to available agents.
+/// Number of local ACP slots this harness supervises. Gateway mode owns no
+/// local agent processes — the daemon spawns workers — so its slot count is
+/// zero and the maintenance sweep must never try to refill one.
+fn local_slot_count(agents: u32, gateway_backend: bool) -> usize {
+    if gateway_backend {
+        0
+    } else {
+        agents as usize
+    }
+}
+
+#[cfg(test)]
+mod local_slot_count_tests {
+    use super::local_slot_count;
+
+    #[test]
+    fn local_mode_supervises_the_configured_pool() {
+        assert_eq!(local_slot_count(10, false), 10);
+    }
+
+    #[test]
+    fn gateway_mode_supervises_no_local_slots() {
+        // Regression: with a non-zero count the 5-minute maintenance sweep
+        // tried to respawn local ACP agents (spawning the configured
+        // `--agent-command`, e.g. a missing `goose`) even though gateway
+        // mode never spawns them.
+        assert_eq!(local_slot_count(10, true), 0);
+    }
+}
+
 fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
