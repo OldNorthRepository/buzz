@@ -11,6 +11,9 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::Managed { .. } => {
+            unreachable!("desktop-managed commands are handled before relay authentication")
+        }
         AgentsCmd::DraftCreate {
             channel,
             display_name,
