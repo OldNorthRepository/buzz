@@ -14,6 +14,7 @@ mod initial_window;
 mod key_backup;
 mod link_preview_tags;
 mod linux_media;
+mod local_control;
 #[cfg(target_os = "macos")]
 mod macos_notifications;
 mod managed_agents;
@@ -417,6 +418,20 @@ pub fn run() {
             }
             if let Ok(mut huddle) = state.huddle_state.lock() {
                 huddle.tts_enabled = tts_settings.agent_text_to_speech;
+            }
+
+            // Expose owner-approved managed-agent operations to the native CLI.
+            // The service is loopback-only and publishes a random bearer token
+            // in an owner-readable app-data descriptor. Skip it while identity
+            // recovery is active because managed-agent mutations are unsafe
+            // until the owner key is available again.
+            if !recovery_mode {
+                let control_app = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = local_control::spawn(control_app).await {
+                        eprintln!("buzz-desktop: local control service failed: {error}");
+                    }
+                });
             }
 
             // Bring up the runtime-owned shared-compute coordinator before
