@@ -13,12 +13,19 @@ cargo install --path crates/buzz-cli
 | Env Var | Mode | Use Case |
 |---------|------|----------|
 | `BUZZ_PRIVATE_KEY` | NIP-98 Schnorr signature | Agents with a keypair |
+| `BUZZ_DESKTOP_CONTROL_FILE` | Local bearer descriptor override | Dev or alternate Buzz Desktop installs |
 
 ```bash
 # Private key identity (NIP-98 signed requests)
 export BUZZ_PRIVATE_KEY="nsec1..."
 buzz channels list
 ```
+
+`buzz agents managed` is local-only and does not load `BUZZ_PRIVATE_KEY`.
+Buzz Desktop creates an owner-readable descriptor containing a random loopback
+bearer token. The CLI uses it to ask the running Desktop process to perform
+managed-agent operations without copying owner or agent private keys into the
+CLI process.
 
 ## Usage
 
@@ -85,6 +92,34 @@ buzz mem set <slug> "my-value"
 buzz mem patch <slug> --base-hash <hex> < diff.patch  # or --no-base-hash
 buzz mem rm <slug>
 
+# Desktop-managed agents (no Nostr key required)
+buzz agents managed status
+buzz agents managed list
+
+# Mutations are plans by default and do not contact Desktop
+buzz agents managed create \
+  --name "Docs-Codex" \
+  --agent-command codex \
+  --system-prompt "Work in the docs repository"
+
+# Execute the reviewed plan explicitly
+buzz agents managed create \
+  --name "Docs-Codex" \
+  --agent-command codex \
+  --system-prompt "Work in the docs repository" \
+  --start \
+  --approve
+buzz agents managed restart <agent-pubkey> --approve
+
+# Provision a complete private project channel in one approved workflow:
+# channel + canvas context + sequential bot membership + started runtimes
+buzz agents managed provision-channel \
+  --name dokploy \
+  --context ~/code/greymatter/greymatter/dokploy \
+  --agent Dokploy-Codex=codex \
+  --agent Dokploy-Claude=claude
+# Review the JSON plan, then rerun with --approve.
+
 # Repository protection
 buzz repos protect list --id my-repo
 buzz repos protect set --id my-repo --ref refs/heads/main --push admin --no-force-push --no-delete
@@ -102,6 +137,14 @@ stored rules in `validation_error` so an owner can remove and repair them.
 
 | Group | Subcommand | Description |
 |-------|-----------|-------------|
+| `agents` | `managed status` | Check the authenticated Desktop control service |
+| | `managed list` | List Desktop-managed agents |
+| | `managed create` | Plan or approve local agent creation |
+| | `managed start` | Plan or approve an agent start |
+| | `managed stop` | Plan or approve an agent stop |
+| | `managed restart` | Plan or approve an agent restart |
+| | `managed delete` | Plan or approve local agent deletion |
+| | `managed provision-channel` | Plan or approve a channel, context canvas, and managed-agent roster |
 | `messages` | `send` | Send a message to a channel |
 | | `send-diff` | Send a code diff with metadata |
 | | `edit` | Edit a message you sent |
@@ -172,7 +215,9 @@ stored rules in `validation_error` so an owner can remove and repair them.
 ```
 buzz <group> <subcommand> [flags]
     │
-    ├─ main.rs ──▶ commands/*.rs ──▶ client.rs ──▶ Buzz Relay REST API
+    ├─ relay commands ──▶ commands/*.rs ──▶ client.rs ──▶ Buzz Relay
+    │
+    ├─ agents managed ──▶ authenticated loopback ──▶ Buzz Desktop
     │  (clap)       (handlers)       (reqwest)
     │
     ├─ validate.rs   (UUID, hex, content size, percent-encode)

@@ -262,6 +262,14 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Manage local agents through the authenticated Buzz Desktop control service
+    Managed {
+        /// Override the Desktop control descriptor path
+        #[arg(long, env = "BUZZ_DESKTOP_CONTROL_FILE")]
+        control_file: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        command: ManagedAgentsCmd,
+    },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -365,6 +373,98 @@ Examples:\n  \
 buzz agents archived"
     )]
     Archived,
+}
+
+#[derive(Subcommand)]
+pub enum ManagedAgentsCmd {
+    /// Check whether the authenticated Desktop control service is available
+    Status,
+    /// List Desktop-managed agents (read-only)
+    List,
+    /// Create an agent; emits a plan unless --approve is supplied
+    Create {
+        /// Agent display name
+        #[arg(long)]
+        name: String,
+        /// Runtime command or catalog ID, such as codex or claude
+        #[arg(long)]
+        agent_command: String,
+        /// Optional managed-agent system prompt
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Optional runtime-specific model ID
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional runtime-specific provider ID
+        #[arg(long)]
+        provider: Option<String>,
+        /// Start the agent immediately after creation
+        #[arg(long)]
+        start: bool,
+        /// Start the agent automatically when Buzz Desktop launches
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        start_on_app_launch: bool,
+        /// Execute the reviewed mutation
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Provision a channel, context canvas, and one or more managed agents
+    ProvisionChannel {
+        /// Channel name
+        #[arg(long)]
+        name: String,
+        /// Existing directory recorded as the channel's working context
+        #[arg(long)]
+        context: std::path::PathBuf,
+        /// Managed agent in NAME=COMMAND form; repeat for each runtime
+        #[arg(long = "agent", required = true)]
+        agents: Vec<String>,
+        /// Optional channel description
+        #[arg(long)]
+        description: Option<String>,
+        /// Channel visibility
+        #[arg(long, default_value = "private")]
+        visibility: String,
+        /// Channel type
+        #[arg(long, default_value = "stream")]
+        channel_type: String,
+        /// Optional instructions prepended to every managed agent prompt
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Start each agent after attaching it to the channel
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        start: bool,
+        /// Start agents automatically when Buzz Desktop launches
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        start_on_app_launch: bool,
+        /// Execute the reviewed provisioning plan
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Start an agent; emits a plan unless --approve is supplied
+    Start {
+        pubkey: String,
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Stop an agent; emits a plan unless --approve is supplied
+    Stop {
+        pubkey: String,
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Restart an agent; emits a plan unless --approve is supplied
+    Restart {
+        pubkey: String,
+        #[arg(long)]
+        approve: bool,
+    },
+    /// Delete a local managed agent; emits a plan unless --approve is supplied
+    Delete {
+        pubkey: String,
+        #[arg(long)]
+        approve: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1953,6 +2053,17 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Desktop-managed commands are local-only and authenticate through the
+    // owner-readable control descriptor. They never need or accept a Nostr
+    // private key in the CLI process.
+    if let Cmd::Agents(AgentsCmd::Managed {
+        ref control_file,
+        ref command,
+    }) = cli.command
+    {
+        return commands::managed_agents::dispatch(command, control_file.as_deref()).await;
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2169,6 +2280,7 @@ mod tests {
                 "archived",
                 "draft-create",
                 "draft-update",
+                "managed",
                 "unarchive"
             ]
         );
@@ -2307,7 +2419,7 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
