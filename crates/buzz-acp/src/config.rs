@@ -330,6 +330,21 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_CHANNELS", value_delimiter = ',')]
     pub channels: Option<Vec<String>>,
 
+    /// Channel UUIDs this agent must never subscribe to or act on.
+    ///
+    /// A deny rule, not an allowlist: it applies in EVERY subscribe mode
+    /// (including `config` mode, where `--channels` is deliberately ignored)
+    /// and it wins over every other scope setting. Use it to carve a single
+    /// channel out of an otherwise broad subscription — e.g. a channel owned
+    /// by a different worker that must not be raced by this agent.
+    ///
+    /// Unlike `--channels`, a malformed entry is a hard startup error rather
+    /// than a warning. Silently dropping an unparseable deny entry would fail
+    /// OPEN (the agent would subscribe to the channel the operator tried to
+    /// exclude), which is the opposite of what a denylist is for.
+    #[arg(long, env = "BUZZ_ACP_IGNORE_CHANNELS", value_delimiter = ',')]
+    pub ignore_channels: Option<Vec<String>>,
+
     #[arg(long, env = "BUZZ_ACP_NO_MENTION_FILTER")]
     pub no_mention_filter: bool,
 
@@ -513,6 +528,12 @@ pub struct Config {
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
     pub channels_override: Option<Vec<String>>,
+    /// Channels this agent must never subscribe to or act on (deny rule).
+    ///
+    /// Parsed and validated at startup, so every consumer works with real
+    /// `Uuid`s and cannot accidentally compare mismatched string forms.
+    /// Empty means "deny nothing". Applies in all subscribe modes.
+    pub ignore_channels: Vec<Uuid>,
     pub no_mention_filter: bool,
     pub config_path: PathBuf,
     pub context_message_limit: u32,
@@ -822,6 +843,15 @@ pub fn propagate_legacy_env_vars() {
 }
 
 impl Config {
+    /// Whether `channel_id` is on the operator's denylist.
+    ///
+    /// The single source of truth for the deny decision. Every scope-resolving
+    /// path (static subscription, dynamic subscription, live event intake)
+    /// consults this, so there is one place to audit and one place to test.
+    pub fn is_channel_ignored(&self, channel_id: Uuid) -> bool {
+        self.ignore_channels.contains(&channel_id)
+    }
+
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
@@ -917,6 +947,40 @@ impl Config {
                     );
                 }
             }
+        }
+
+        // Deny list. Fail closed on a malformed entry: warning-and-skip would
+        // leave the agent subscribed to exactly the channel the operator was
+        // trying to exclude, and the operator would have no signal that the
+        // exclusion never took effect.
+        let mut ignore_channels: Vec<Uuid> = Vec::new();
+        if let Some(ref entries) = args.ignore_channels {
+            for entry in entries {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match trimmed.parse::<Uuid>() {
+                    Ok(id) => {
+                        if !ignore_channels.contains(&id) {
+                            ignore_channels.push(id);
+                        }
+                    }
+                    Err(_) => {
+                        return Err(ConfigError::ConfigFile(format!(
+                            "--ignore-channels / BUZZ_ACP_IGNORE_CHANNELS entry {trimmed:?} \
+                             is not a valid channel UUID; refusing to start rather than \
+                             silently subscribing to a channel that was meant to be excluded"
+                        )));
+                    }
+                }
+            }
+        }
+        if !ignore_channels.is_empty() {
+            tracing::info!(
+                ignored = ?ignore_channels.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+                "channel denylist active — these channels will never be subscribed to or acted on"
+            );
         }
 
         let heartbeat_interval = if args.heartbeat_interval > 86400 {
@@ -1080,6 +1144,7 @@ impl Config {
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
             channels_override: args.channels,
+            ignore_channels,
             no_mention_filter: args.no_mention_filter,
             config_path: args.config,
             context_message_limit: args.context_message_limit,
@@ -1124,8 +1189,23 @@ impl Config {
             modes.sort();
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
+        // Channel UUIDs are not secret, and an operator debugging "why is the
+        // agent still answering in that channel" needs to see the denylist
+        // actually took effect at startup.
+        let ignore_channels_detail = if self.ignore_channels.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ignore_channels=[{}]",
+                self.ignore_channels
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1148,6 +1228,7 @@ impl Config {
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
+            ignore_channels_detail,
         )
     }
 }
@@ -1240,6 +1321,16 @@ pub fn resolve_channel_filters(
     use buzz_core::kind::{
         KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
+
+    // The denylist is applied to the discovered set FIRST, so it constrains
+    // every subscribe mode uniformly — including Config mode, which iterates
+    // `discovered_channels` directly and ignores `channels_override`.
+    let discovered_channels: Vec<Uuid> = discovered_channels
+        .iter()
+        .copied()
+        .filter(|id| !config.is_channel_ignored(*id))
+        .collect();
+    let discovered_channels = discovered_channels.as_slice();
 
     let target_channels: Vec<Uuid> = if let Some(ref overrides) = config.channels_override {
         overrides
@@ -1342,6 +1433,17 @@ pub fn resolve_dynamic_channel_filter(
     use buzz_core::kind::{
         KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
+
+    // Denylist wins over every other scope rule, in every subscribe mode.
+    // Checked first so a denied channel can never be picked up by dynamic
+    // discovery (e.g. the agent being added to the channel at runtime).
+    if config.is_channel_ignored(channel_id) {
+        tracing::debug!(
+            channel_id = %channel_id,
+            "refusing dynamic subscription: channel is on the denylist"
+        );
+        return None;
+    }
 
     // In Mentions/All mode, if the operator explicitly constrained channels
     // with --channels, only allow dynamic subscription to channels in that
@@ -1454,6 +1556,7 @@ mod tests {
             ignore_self: true,
             kinds_override: None,
             channels_override: None,
+            ignore_channels: Vec::new(),
             no_mention_filter: false,
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
@@ -1807,6 +1910,148 @@ mod tests {
         assert!(result.contains_key(&ch_a));
         assert!(!result.contains_key(&ch_b));
         assert!(!result.contains_key(&ch_unknown));
+    }
+
+    // --- Channel denylist (--ignore-channels / BUZZ_ACP_IGNORE_CHANNELS) ---
+    //
+    // The property under test throughout: the denied channel disappears from
+    // the agent's scope while every OTHER channel keeps exactly the
+    // subscription it had before. A denylist that also silences unrelated
+    // channels is as much a bug as one that fails to silence the target.
+
+    #[test]
+    fn ignore_channels_excludes_only_the_denied_channel_in_mentions_mode() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        let keep_a = Uuid::new_v4();
+        let denied = Uuid::new_v4();
+        let keep_b = Uuid::new_v4();
+        config.ignore_channels = vec![denied];
+
+        let discovered = vec![keep_a, denied, keep_b];
+        let result = resolve_channel_filters(&config, &discovered, &[]);
+
+        assert!(
+            !result.contains_key(&denied),
+            "denied channel must not be subscribed"
+        );
+        assert!(
+            result.contains_key(&keep_a),
+            "other channels stay subscribed"
+        );
+        assert!(
+            result.contains_key(&keep_b),
+            "other channels stay subscribed"
+        );
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn ignore_channels_applies_in_config_mode_where_channels_override_does_not() {
+        // The whole point of a denylist: it binds in Config mode too, where
+        // `--channels` is deliberately ignored per the CLI contract.
+        let config_no_deny = test_config(SubscribeMode::Config);
+        let keep = Uuid::new_v4();
+        let denied = Uuid::new_v4();
+        let discovered = vec![keep, denied];
+        let rules = vec![make_rule(
+            "catch-all",
+            crate::filter::ChannelScope::All("all".into()),
+            vec![9],
+            true,
+        )];
+
+        // Baseline: without the denylist, a catch-all rule covers both.
+        let before = resolve_channel_filters(&config_no_deny, &discovered, &rules);
+        assert!(
+            before.contains_key(&denied),
+            "precondition: catch-all rule covers the channel before denial"
+        );
+        assert!(before.contains_key(&keep));
+
+        let mut config = test_config(SubscribeMode::Config);
+        config.ignore_channels = vec![denied];
+        let after = resolve_channel_filters(&config, &discovered, &rules);
+
+        assert!(
+            !after.contains_key(&denied),
+            "denylist must bind in Config mode"
+        );
+        assert!(
+            after.contains_key(&keep),
+            "unrelated channel keeps its rule-derived subscription"
+        );
+    }
+
+    #[test]
+    fn ignore_channels_blocks_dynamic_subscription_in_every_mode() {
+        // A denied channel must stay denied even when the agent is ADDED to it
+        // at runtime — otherwise membership changes silently reopen the race.
+        let denied = Uuid::new_v4();
+        let allowed = Uuid::new_v4();
+
+        for mode in [
+            SubscribeMode::Mentions,
+            SubscribeMode::All,
+            SubscribeMode::Config,
+        ] {
+            let mut config = test_config(mode.clone());
+            config.ignore_channels = vec![denied];
+            let rules = vec![make_rule(
+                "catch-all",
+                crate::filter::ChannelScope::All("all".into()),
+                vec![],
+                false,
+            )];
+
+            assert!(
+                resolve_dynamic_channel_filter(&config, denied, &rules).is_none(),
+                "denied channel must not be dynamically subscribed in {mode:?} mode"
+            );
+            assert!(
+                resolve_dynamic_channel_filter(&config, allowed, &rules).is_some(),
+                "non-denied channel must still be dynamically subscribed in {mode:?} mode"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_channels_empty_denies_nothing() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(config.ignore_channels.is_empty());
+
+        let discovered = vec![Uuid::new_v4(), Uuid::new_v4()];
+        let result = resolve_channel_filters(&config, &discovered, &[]);
+        assert_eq!(result.len(), 2, "no denylist means no channels removed");
+        assert!(!config.is_channel_ignored(discovered[0]));
+    }
+
+    #[test]
+    fn is_channel_ignored_matches_only_the_listed_uuid() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        let denied = Uuid::new_v4();
+        config.ignore_channels = vec![denied];
+
+        assert!(config.is_channel_ignored(denied));
+        assert!(!config.is_channel_ignored(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn ignore_channels_summary_shows_denylist_when_set() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        let denied = Uuid::new_v4();
+        config.ignore_channels = vec![denied];
+
+        let summary = config.summary();
+        assert!(
+            summary.contains(&format!("ignore_channels=[{denied}]")),
+            "summary must surface the active denylist: {summary}"
+        );
+    }
+
+    #[test]
+    fn ignore_channels_summary_omitted_when_empty() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(!config.summary().contains("ignore_channels"));
     }
 
     #[test]
@@ -2736,6 +2981,68 @@ channels = "ALL"
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn ignore_channels_full_path_parses_and_dedupes() {
+        // Proves the #[arg(long, env = "BUZZ_ACP_IGNORE_CHANNELS")] wiring and
+        // the comma value_delimiter actually reach Config.ignore_channels.
+        let a = "ad881e69-03a2-4bb8-b818-0cf46984f4d2";
+        let b = "11111111-2222-3333-4444-555555555555";
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--ignore-channels",
+            &format!("{a}, {b} ,{a}"),
+        ])
+        .expect("clap should parse args");
+        let config = Config::from_args(args).expect("valid UUIDs should be accepted");
+
+        assert_eq!(
+            config.ignore_channels,
+            vec![a.parse::<Uuid>().unwrap(), b.parse::<Uuid>().unwrap()],
+            "entries are trimmed, parsed, and deduplicated in order"
+        );
+        assert!(config.is_channel_ignored(a.parse().unwrap()));
+    }
+
+    #[test]
+    fn ignore_channels_full_path_rejects_malformed_entry() {
+        // FAIL CLOSED. A denylist that warns-and-skips a typo would leave the
+        // agent subscribed to precisely the channel the operator excluded,
+        // with no signal that the exclusion never took effect. Startup must
+        // fail instead.
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--ignore-channels",
+            "ad881e69-03a2-4bb8-b818-0cf46984f4d2,not-a-uuid",
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+
+        assert!(
+            result.is_err(),
+            "a malformed denylist entry must fail startup, not be silently skipped"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not-a-uuid"),
+            "error should name the bad entry: {msg}"
+        );
+    }
+
+    #[test]
+    fn ignore_channels_absent_by_default() {
+        let args = CliArgs::try_parse_from(["buzz-acp", "--private-key", TEST_PRIVATE_KEY])
+            .expect("clap should parse args");
+        let config = Config::from_args(args).expect("config should build");
+        assert!(
+            config.ignore_channels.is_empty(),
+            "no denylist configured means nothing is denied"
+        );
+    }
 
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {
