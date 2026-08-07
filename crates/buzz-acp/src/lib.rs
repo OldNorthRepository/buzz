@@ -1956,6 +1956,25 @@ async fn tokio_main() -> Result<()> {
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
                         Some(buzz_event) => {
+                            // Channel denylist — enforced before ANY other handling
+                            // (membership bookkeeping, !shutdown/!cancel control
+                            // commands, reactions, rule matching). A denied channel
+                            // is invisible to this agent, so it can never race the
+                            // worker that owns that channel.
+                            //
+                            // Subscription resolution already excludes these channels;
+                            // this is the second layer, covering events that arrive
+                            // from a subscription established before the denylist was
+                            // configured, or from a relay-side replay.
+                            if config.is_channel_ignored(buzz_event.channel_id) {
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    kind = buzz_event.event.kind.as_u16(),
+                                    "dropping event from denylisted channel"
+                                );
+                                continue;
+                            }
+
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
@@ -5093,6 +5112,7 @@ mod build_mcp_servers_tests {
             ignore_self: true,
             kinds_override: None,
             channels_override: None,
+            ignore_channels: Vec::new(),
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
@@ -5261,6 +5281,7 @@ mod error_outcome_emission_tests {
             ignore_self: true,
             kinds_override: None,
             channels_override: None,
+            ignore_channels: Vec::new(),
             no_mention_filter: false,
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,

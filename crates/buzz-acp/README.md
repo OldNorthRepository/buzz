@@ -152,6 +152,33 @@ Owner control commands must be kind:9 stream messages from the owner, must menti
 
 > **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.
 
+### Channel denylist
+
+| Flag | Env Var | Default | Description |
+|------|---------|---------|-------------|
+| `--ignore-channels` | `BUZZ_ACP_IGNORE_CHANNELS` | — | Comma-separated channel UUIDs this agent must never subscribe to or act on. |
+
+`--channels` is an *allowlist*: it says which channels are in scope, and it is deliberately ignored in `config` subscribe mode. `--ignore-channels` is the complementary *deny* rule, and it behaves differently in three ways that matter:
+
+- **It applies in every subscribe mode**, including `config` mode. A deny that a subscribe mode could opt out of would not be a safety control.
+- **It wins over every other scope setting** — `--channels`, discovered membership, and TOML subscription rules alike.
+- **A malformed entry is a hard startup error**, not a warning. Silently skipping an unparseable deny entry would fail *open*: the harness would subscribe to exactly the channel the operator was trying to exclude, and nothing would say so.
+
+Enforcement is layered, so a denied channel is invisible to the agent even across reconnects and runtime membership changes:
+
+1. `resolve_channel_filters` never opens a relay subscription for the channel at startup.
+2. `resolve_dynamic_channel_filter` refuses to subscribe when the agent is *added* to the channel at runtime.
+3. The event-intake loop drops any event from a denied channel before **all** other handling — membership bookkeeping, `!shutdown`/`!cancel`/`!rotate` owner control commands, the author gate, and rule matching. This covers relay replay and subscriptions established before the denylist was configured.
+
+The intended use is carving one channel out of an otherwise broad subscription so a *different* worker can own it exclusively — e.g. a scheduled reconciler that is the sole reply processor for its channel and must not be raced by a long-running mention-subscribed agent. Expressing that as an allowlist of every *other* channel would go stale every time a channel is created.
+
+```bash
+# This agent serves every channel it is a member of, except one.
+export BUZZ_ACP_IGNORE_CHANNELS="ad881e69-03a2-4bb8-b818-0cf46984f4d2"
+```
+
+The active denylist is echoed at startup (`INFO`) and included in the config summary line, so an operator debugging "why is the agent still answering there?" can confirm the exclusion took effect.
+
 **Examples:**
 
 ```bash
