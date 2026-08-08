@@ -3124,6 +3124,7 @@ dependencies = [
 [[package]]
 name = "gateway-api"
 version = "0.1.0"
+source = "git+https://github.com/OldNorthRepository/agent-gateway.git?rev=4f16e23#4f16e2386af603a1bad1ae2ea41be9a7720ce296"
 dependencies = [
  "axum",
  "futures-util",
@@ -3142,6 +3143,7 @@ dependencies = [
 [[package]]
 name = "gateway-core"
 version = "0.1.0"
+source = "git+https://github.com/OldNorthRepository/agent-gateway.git?rev=4f16e23#4f16e2386af603a1bad1ae2ea41be9a7720ce296"
 dependencies = [
  "blake3",
  "serde",
