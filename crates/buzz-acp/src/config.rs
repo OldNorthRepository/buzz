@@ -353,7 +353,7 @@ pub struct CliArgs {
     /// argv. Required for gateway worker mode, where the daemon clears the
     /// environment and argv is visible in /proc: a key file is the only
     /// channel that leaks nowhere. Wins over --private-key when both are set.
-    #[arg(long, env = "BUZZ_PRIVATE_KEY_FILE")]
+    #[arg(long, env = "BUZZ_PRIVATE_KEY_FILE", hide_env_values = true)]
     pub private_key_file: Option<PathBuf>,
 
     /// Run as a GWP/0 gateway worker: serve turns over stdin/stdout for an

@@ -75,6 +75,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
         turn_liveness_interval: Duration::from_secs(config.turn_liveness_secs),
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
+        session_title: config.session_title.clone(),
         team_instructions: config.team_instructions.clone(),
         base_prompt: if config.no_base_prompt {
             None
@@ -251,7 +252,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<()> {
 }
 
 async fn spawn_agent(startup: &PoolStartup) -> anyhow::Result<OwnedAgent> {
-    let mut pool = initialize_agent_pool(startup, None).await?;
+    let mut pool = initialize_agent_pool(startup, None, 1).await?;
     for slot in pool.agents_mut() {
         if let Some(agent) = slot.take() {
             return Ok(agent);
