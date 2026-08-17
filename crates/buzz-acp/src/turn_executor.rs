@@ -76,6 +76,12 @@ pub enum GatewayExecutorError {
     Connect(#[from] ClientError),
     #[error("gateway has no route '{0}' — create it with `agent-gateway routes set` first")]
     RouteMissing(String),
+    #[error("gateway read route '{route}' uses permission profile '{profile}', expected 'repository_read'")]
+    ReadRouteProfile { route: String, profile: String },
+    #[error("gateway write route '{route}' uses permission profile '{profile}', expected 'repository_write'")]
+    WriteRouteProfile { route: String, profile: String },
+    #[error("gateway write route '{route}' does not bind channel context '{channel}'")]
+    WriteRouteContext { route: String, channel: Uuid },
 }
 
 /// Completion of one gateway-dispatched turn, delivered to the main loop on
@@ -93,9 +99,12 @@ pub struct GatewayExecutor {
     client: ControlClient,
     /// Default route for channels with no explicit or auto mapping.
     route_id: String,
-    /// Explicit channel -> route overrides from configuration.
+    /// Explicit read-only channel -> route overrides from configuration.
     channel_routes: HashMap<Uuid, String>,
-    /// Name-convention auto-routing, when enabled.
+    /// Explicit write-capable channel -> route overrides. UUID binding is
+    /// verified against gateway route metadata during connect.
+    write_channel_routes: HashMap<Uuid, String>,
+    /// Name-convention auto-routing, when enabled. Always read-only.
     auto_route: Option<AutoRouteConfig>,
     /// Agent principal of the default route; auto-created routes reuse it.
     agent_id: String,
@@ -108,6 +117,34 @@ pub struct GatewayExecutor {
     /// channel_id -> in-flight turn_id, for `!cancel` routing.
     channels: Mutex<HashMap<Uuid, String>>,
     notify: tokio::sync::mpsc::UnboundedSender<GatewayTurnDone>,
+}
+
+fn explicit_route_for(
+    channel_id: Uuid,
+    write_routes: &HashMap<Uuid, String>,
+    read_routes: &HashMap<Uuid, String>,
+) -> Option<(String, bool)> {
+    write_routes
+        .get(&channel_id)
+        .map(|route| (route.clone(), true))
+        .or_else(|| {
+            read_routes
+                .get(&channel_id)
+                .map(|route| (route.clone(), false))
+        })
+}
+
+fn existing_auto_route_matches(
+    route: &gateway_api::protocol::RouteView,
+    channel_id: Uuid,
+    expected_workspace: &std::path::Path,
+) -> bool {
+    route.permission_profile == "repository_read"
+        && route
+            .contexts
+            .iter()
+            .any(|context| context == &channel_id.to_string())
+        && std::path::Path::new(&route.workspace_path) == expected_workspace
 }
 
 /// Turns a channel name into a workspace directory slug: lowercased, with
@@ -146,9 +183,42 @@ impl GatewayExecutor {
         else {
             return Err(GatewayExecutorError::RouteMissing(config.route_id));
         };
+        if default_route.permission_profile != "repository_read" {
+            return Err(GatewayExecutorError::ReadRouteProfile {
+                route: default_route.id.clone(),
+                profile: default_route.permission_profile.clone(),
+            });
+        }
         for route in config.channel_routes.values() {
-            if !routes.routes.iter().any(|view| &view.id == route) {
+            let Some(view) = routes.routes.iter().find(|view| &view.id == route) else {
                 return Err(GatewayExecutorError::RouteMissing(route.clone()));
+            };
+            if view.permission_profile != "repository_read" {
+                return Err(GatewayExecutorError::ReadRouteProfile {
+                    route: route.clone(),
+                    profile: view.permission_profile.clone(),
+                });
+            }
+        }
+        for (channel, route) in &config.write_channel_routes {
+            let Some(view) = routes.routes.iter().find(|view| &view.id == route) else {
+                return Err(GatewayExecutorError::RouteMissing(route.clone()));
+            };
+            if view.permission_profile != "repository_write" {
+                return Err(GatewayExecutorError::WriteRouteProfile {
+                    route: route.clone(),
+                    profile: view.permission_profile.clone(),
+                });
+            }
+            if !view
+                .contexts
+                .iter()
+                .any(|context| context == &channel.to_string())
+            {
+                return Err(GatewayExecutorError::WriteRouteContext {
+                    route: route.clone(),
+                    channel: *channel,
+                });
             }
         }
         let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -158,6 +228,7 @@ impl GatewayExecutor {
                 agent_id: default_route.agent_id.clone(),
                 route_id: config.route_id,
                 channel_routes: config.channel_routes,
+                write_channel_routes: config.write_channel_routes,
                 auto_route: config.auto_route,
                 resolved_routes: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
@@ -171,12 +242,17 @@ impl GatewayExecutor {
     /// The route a channel's turns run on: explicit mapping first, then the
     /// name-convention auto route (created on the gateway on first use), then
     /// the default. Decisions are cached per channel.
-    async fn route_for(&self, channel_id: Uuid, channel_name: Option<&str>) -> String {
-        if let Some(route) = self.channel_routes.get(&channel_id) {
-            return route.clone();
+    async fn route_for(&self, channel_id: Uuid, channel_name: Option<&str>) -> (String, bool) {
+        if let Some(route) =
+            explicit_route_for(channel_id, &self.write_channel_routes, &self.channel_routes)
+        {
+            return route;
         }
         if let Some(decision) = self.resolved_routes.lock().await.get(&channel_id) {
-            return decision.clone().unwrap_or_else(|| self.route_id.clone());
+            return (
+                decision.clone().unwrap_or_else(|| self.route_id.clone()),
+                false,
+            );
         }
         let decision = match (&self.auto_route, channel_name) {
             (Some(auto), Some(name)) => self.ensure_auto_route(channel_id, auto, name).await,
@@ -186,7 +262,7 @@ impl GatewayExecutor {
             .lock()
             .await
             .insert(channel_id, decision.clone());
-        decision.unwrap_or_else(|| self.route_id.clone())
+        (decision.unwrap_or_else(|| self.route_id.clone()), false)
     }
 
     async fn ensure_auto_route(
@@ -209,10 +285,23 @@ impl GatewayExecutor {
         }
         let route_id = format!("ch-{slug}");
         match self.client.routes().await {
-            Ok(routes) if routes.routes.iter().any(|route| route.id == route_id) => {
-                return Some(route_id);
+            Ok(routes) => {
+                if let Some(route) = routes.routes.iter().find(|route| route.id == route_id) {
+                    let expected_workspace = std::fs::canonicalize(&workspace).ok();
+                    let matches = expected_workspace.as_deref().is_some_and(|workspace| {
+                        existing_auto_route_matches(route, channel_id, workspace)
+                    });
+                    if matches {
+                        return Some(route_id);
+                    }
+                    tracing::warn!(
+                        channel = %channel_id,
+                        route = %route_id,
+                        "existing auto-route id has mismatched profile, context, or workspace; using the default route"
+                    );
+                    return None;
+                }
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%error, "route listing failed; using the default route");
                 return None;
@@ -270,7 +359,7 @@ impl GatewayExecutor {
                 .resolve(channel_id)
                 .await
                 .map(|info| info.name);
-            let route = executor
+            let (route, write_capable) = executor
                 .route_for(channel_id, channel_name.as_deref())
                 .await;
             executor
@@ -279,7 +368,7 @@ impl GatewayExecutor {
                 .await
                 .insert(channel_id, id.clone());
             let outcome = executor
-                .run_turn_on(&route, channel_id, &id, payload, None)
+                .run_turn_on(&route, write_capable, channel_id, &id, payload, None)
                 .await;
             executor.channels.lock().await.remove(&channel_id);
             let _ = executor.notify.send(GatewayTurnDone {
@@ -304,25 +393,36 @@ impl GatewayExecutor {
     }
 }
 
+fn gateway_job_policy(write_capable: bool) -> (&'static str, &'static str) {
+    if write_capable {
+        ("repository_write", "workspace_write")
+    } else {
+        ("repository_read", "external_effects")
+    }
+}
+
 impl GatewayExecutor {
     async fn run_turn_on(
         &self,
         route_id: &str,
+        write_capable: bool,
         channel_id: Uuid,
         turn_id: &str,
         payload: serde_json::Value,
         timeout_ms: Option<i64>,
     ) -> TurnOutcome {
+        let (permission_profile, side_effect_class) = gateway_job_policy(write_capable);
         let request = SubmitJobRequest {
             route_id: Some(route_id.to_owned()),
             agent_id: None,
-            context_id: None,
+            context_id: write_capable.then(|| channel_id.to_string()),
             thread_id: Some(channel_id.to_string()),
             task: payload.to_string(),
-            permission_profile: None,
-            // Agent turns publish to the relay: real external effects, never
-            // replayable. The gateway will reconcile, not rerun, on a crash.
-            side_effect_class: Some("external_effects".into()),
+            permission_profile: Some(permission_profile.into()),
+            // Write routes must declare workspace_write so the gateway applies
+            // write concurrency and never retries after an uncertain outcome.
+            // Read routes still publish relay replies, so they are external effects.
+            side_effect_class: Some(side_effect_class.into()),
             priority: None,
             timeout_ms,
             // The turn id makes resubmission after a harness restart dedup
@@ -333,8 +433,11 @@ impl GatewayExecutor {
         let submitted = match self.client.submit(request).await {
             Ok(response) => response,
             Err(error) => {
-                return TurnOutcome::Failed {
-                    reason: format!("gateway submit failed: {error}"),
+                // The daemon may have durably admitted the idempotent job before
+                // the response was lost. Without a job id there is nothing to
+                // poll, so the only truthful classification is unknown.
+                return TurnOutcome::UnknownOutcome {
+                    reason: format!("gateway submit outcome is unknown: {error}"),
                 };
             }
         };
@@ -383,9 +486,16 @@ impl TurnExecutor for GatewayExecutor {
         payload: serde_json::Value,
         timeout_ms: Option<i64>,
     ) -> TurnOutcome {
-        let route = self.route_id.clone();
-        self.run_turn_on(&route, channel_id, turn_id, payload, timeout_ms)
-            .await
+        let (route, write_capable) = self.route_for(channel_id, None).await;
+        self.run_turn_on(
+            &route,
+            write_capable,
+            channel_id,
+            turn_id,
+            payload,
+            timeout_ms,
+        )
+        .await
     }
 
     async fn cancel_turn(&self, turn_id: &str) -> bool {
@@ -500,6 +610,83 @@ pub fn map_job_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route_view(
+        channel: Uuid,
+        profile: &str,
+        workspace: &str,
+    ) -> gateway_api::protocol::RouteView {
+        gateway_api::protocol::RouteView {
+            id: "ch-repo".into(),
+            agent_id: "agent".into(),
+            contexts: vec![channel.to_string()],
+            runtime: "runtime".into(),
+            model: None,
+            workspace_path: workspace.into(),
+            workspace_id: "ino:1".into(),
+            session_mode: "thread".into(),
+            permission_profile: profile.into(),
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn existing_auto_routes_must_match_profile_context_and_workspace() {
+        let channel = Uuid::new_v4();
+        assert!(existing_auto_route_matches(
+            &route_view(channel, "repository_read", "/code/repo"),
+            channel,
+            std::path::Path::new("/code/repo"),
+        ));
+        assert!(!existing_auto_route_matches(
+            &route_view(channel, "repository_write", "/code/repo"),
+            channel,
+            std::path::Path::new("/code/repo"),
+        ));
+        assert!(!existing_auto_route_matches(
+            &route_view(Uuid::new_v4(), "repository_read", "/code/repo"),
+            channel,
+            std::path::Path::new("/code/repo"),
+        ));
+        assert!(!existing_auto_route_matches(
+            &route_view(channel, "repository_read", "/code/other"),
+            channel,
+            std::path::Path::new("/code/repo"),
+        ));
+    }
+
+    #[test]
+    fn explicit_uuid_write_routes_take_precedence_and_carry_write_authority() {
+        let channel = Uuid::new_v4();
+        assert_eq!(
+            explicit_route_for(
+                channel,
+                &HashMap::from([(channel, "write".into())]),
+                &HashMap::from([(channel, "read".into())]),
+            ),
+            Some(("write".into(), true))
+        );
+        assert_eq!(
+            explicit_route_for(
+                channel,
+                &HashMap::new(),
+                &HashMap::from([(channel, "read".into())]),
+            ),
+            Some(("read".into(), false))
+        );
+    }
+
+    #[test]
+    fn write_routes_use_the_atomic_gateway_write_contract() {
+        assert_eq!(
+            gateway_job_policy(true),
+            ("repository_write", "workspace_write")
+        );
+        assert_eq!(
+            gateway_job_policy(false),
+            ("repository_read", "external_effects")
+        );
+    }
 
     #[test]
     fn turn_payload_roundtrips_through_encode_and_decode() {

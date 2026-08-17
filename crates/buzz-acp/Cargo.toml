@@ -19,7 +19,7 @@ path = "src/main.rs"
 # Internal
 buzz-core = { workspace = true }
 # Agent-gateway control-plane client, revision-pinned for reproducible builds.
-gateway-api = { git = "https://github.com/OldNorthRepository/agent-gateway.git", rev = "4f16e23", version = "0.1.0" }
+gateway-api = { git = "https://github.com/OldNorthRepository/agent-gateway.git", rev = "92dff68", version = "0.1.0" }
 buzz-sdk = { workspace = true }
 buzz-persona = { path = "../buzz-persona" }
 

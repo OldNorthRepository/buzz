@@ -71,9 +71,12 @@ pub struct GatewayBackendConfig {
     pub socket: PathBuf,
     /// Default route for channels with no explicit or auto mapping.
     pub route_id: String,
-    /// Explicit channel -> route overrides. Highest priority.
+    /// Explicit read-only channel -> route overrides.
     pub channel_routes: std::collections::HashMap<uuid::Uuid, String>,
-    /// Name-convention auto-routing, when enabled.
+    /// Explicit write-capable channel -> route overrides. These are never
+    /// inferred from channel names; the operator must bind the channel UUID.
+    pub write_channel_routes: std::collections::HashMap<uuid::Uuid, String>,
+    /// Name-convention auto-routing, when enabled. Auto routes remain read-only.
     pub auto_route: Option<AutoRouteConfig>,
 }
 
@@ -122,7 +125,14 @@ pub fn resolve_gateway_backend_full(
                 "--gateway-routes entry for {channel} has an empty route id"
             )));
         }
-        channel_routes.insert(channel, route.trim().to_owned());
+        if channel_routes
+            .insert(channel, route.trim().to_owned())
+            .is_some()
+        {
+            return Err(ConfigError::Gateway(format!(
+                "--gateway-routes contains duplicate channel {channel}"
+            )));
+        }
     }
     let auto_route = match (auto_root, auto_runtime) {
         (Some(root), Some(runtime)) if !runtime.trim().is_empty() => {
@@ -149,8 +159,45 @@ pub fn resolve_gateway_backend_full(
         socket,
         route_id,
         channel_routes,
+        write_channel_routes: std::collections::HashMap::new(),
         auto_route,
     }))
+}
+
+fn resolve_gateway_write_routes(
+    pairs: &[String],
+    read_routes: &std::collections::HashMap<Uuid, String>,
+) -> Result<std::collections::HashMap<Uuid, String>, ConfigError> {
+    let mut routes = std::collections::HashMap::new();
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (channel, route) = pair.split_once('=').ok_or_else(|| {
+            ConfigError::Gateway(format!(
+                "--gateway-write-routes entry '{pair}' is not <channel-uuid>=<route-id>"
+            ))
+        })?;
+        let channel = Uuid::parse_str(channel.trim())
+            .map_err(|_| ConfigError::Gateway(format!("'{channel}' is not a channel uuid")))?;
+        if route.trim().is_empty() {
+            return Err(ConfigError::Gateway(format!(
+                "--gateway-write-routes entry for {channel} has an empty route id"
+            )));
+        }
+        if read_routes.contains_key(&channel) {
+            return Err(ConfigError::Gateway(format!(
+                "channel {channel} cannot appear in both --gateway-routes and --gateway-write-routes"
+            )));
+        }
+        if routes.insert(channel, route.trim().to_owned()).is_some() {
+            return Err(ConfigError::Gateway(format!(
+                "--gateway-write-routes contains duplicate channel {channel}"
+            )));
+        }
+    }
+    Ok(routes)
 }
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
@@ -627,6 +674,12 @@ pub struct CliArgs {
     /// Per-channel route overrides: `<channel-uuid>=<route-id>` pairs.
     #[arg(long, env = "BUZZ_ACP_GATEWAY_ROUTES", value_delimiter = ',')]
     pub gateway_routes: Vec<String>,
+
+    /// Explicit write-capable routes: `<channel-uuid>=<route-id>` pairs.
+    /// The referenced gateway route must be `repository_write` and must bind
+    /// the same channel UUID as one of its contexts.
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_WRITE_ROUTES", value_delimiter = ',')]
+    pub gateway_write_routes: Vec<String>,
 
     /// Auto-route root: a channel named `foo` maps to `<root>/foo` when that
     /// directory exists, and the harness creates gateway route `ch-foo` for
@@ -1233,7 +1286,7 @@ impl Config {
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
-        let gateway = resolve_gateway_backend_full(
+        let mut gateway = resolve_gateway_backend_full(
             args.backend,
             args.gateway_socket.clone(),
             args.gateway_route.clone(),
@@ -1241,6 +1294,10 @@ impl Config {
             args.gateway_auto_route_root.clone(),
             args.gateway_auto_route_runtime.clone(),
         )?;
+        if let Some(gateway) = gateway.as_mut() {
+            gateway.write_channel_routes =
+                resolve_gateway_write_routes(&args.gateway_write_routes, &gateway.channel_routes)?;
+        }
         // GWP/0 has no mid-turn channel, so steer/interrupt cannot reach a
         // gateway turn. Force queue-mode handling rather than silently
         // accepting a mode the backend cannot honor (steering returns with
@@ -1326,8 +1383,19 @@ impl Config {
             modes.sort();
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
+        let gateway_detail = self.gateway.as_ref().map_or_else(
+            || " backend=local".to_string(),
+            |gateway| {
+                format!(
+                    " backend=gateway read_routes={} write_routes={} auto_route={}",
+                    gateway.channel_routes.len(),
+                    gateway.write_channel_routes.len(),
+                    gateway.auto_route.is_some(),
+                )
+            },
+        );
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1350,6 +1418,7 @@ impl Config {
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
+            gateway_detail,
         )
     }
 }
@@ -3264,6 +3333,42 @@ mod gateway_backend_tests {
             &["not-a-uuid=route".into()],
             None,
             None,
+        )
+        .is_err());
+        assert!(resolve_gateway_backend_full(
+            ExecutionBackend::Gateway,
+            Some(PathBuf::from("/run/gw.sock")),
+            Some("default".into()),
+            &[format!("{channel}=one"), format!("{channel}=two")],
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn write_routes_require_uuid_binding_and_cannot_overlap_read_routes() {
+        let channel = Uuid::new_v4();
+        let routes =
+            resolve_gateway_write_routes(&[format!("{channel}=write-route")], &HashMap::new())
+                .expect("valid write route");
+        assert_eq!(
+            routes.get(&channel).map(String::as_str),
+            Some("write-route")
+        );
+
+        assert!(
+            resolve_gateway_write_routes(&["not-a-uuid=route".into()], &HashMap::new()).is_err()
+        );
+        assert!(resolve_gateway_write_routes(
+            &[format!("{channel}=one"), format!("{channel}=two")],
+            &HashMap::new(),
+        )
+        .is_err());
+        assert!(resolve_gateway_write_routes(&[format!("{channel}=")], &HashMap::new()).is_err());
+        assert!(resolve_gateway_write_routes(
+            &[format!("{channel}=write-route")],
+            &HashMap::from([(channel, "read-route".into())]),
         )
         .is_err());
     }
