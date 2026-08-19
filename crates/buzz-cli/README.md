@@ -114,10 +114,10 @@ buzz agents managed restart <agent-pubkey> --approve
 # Provision a complete private project channel in one approved workflow:
 # channel + canvas context + sequential bot membership + started runtimes
 buzz agents managed provision-channel \
-  --name dokploy \
-  --context ~/code/greymatter/greymatter/dokploy \
-  --agent Dokploy-Codex=codex \
-  --agent Dokploy-Claude=claude
+  --name project-alpha \
+  --context ~/code/project-alpha \
+  --agent Project-Alpha-Codex=codex \
+  --agent Project-Alpha-Claude=claude
 # Review the JSON plan, then rerun with --approve.
 
 # Repository protection

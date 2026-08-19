@@ -619,19 +619,19 @@ mod tests {
     #[test]
     fn agent_specs_require_nonempty_name_and_command() {
         let parsed = parse_agent_specs(&[
-            "Dokploy-Codex=codex".to_string(),
-            "Dokploy-Claude=claude".to_string(),
+            "Project-Alpha-Codex=codex".to_string(),
+            "Project-Alpha-Claude=claude".to_string(),
         ])
         .unwrap();
         assert_eq!(
             parsed,
             vec![
                 AgentSpec {
-                    name: "Dokploy-Codex".to_string(),
+                    name: "Project-Alpha-Codex".to_string(),
                     command: "codex".to_string(),
                 },
                 AgentSpec {
-                    name: "Dokploy-Claude".to_string(),
+                    name: "Project-Alpha-Claude".to_string(),
                     command: "claude".to_string(),
                 }
             ]
@@ -644,11 +644,11 @@ mod tests {
     #[test]
     fn canvas_records_exact_context_and_roster() {
         let agents = vec![AgentSpec {
-            name: "Dokploy-Codex".to_string(),
+            name: "Project-Alpha-Codex".to_string(),
             command: "codex".to_string(),
         }];
-        let content = canvas_content("dokploy", Path::new("/srv/dokploy"), &agents);
-        assert!(content.contains("`/srv/dokploy`"));
-        assert!(content.contains("**Dokploy-Codex** — `codex`"));
+        let content = canvas_content("project-alpha", Path::new("/srv/project-alpha"), &agents);
+        assert!(content.contains("`/srv/project-alpha`"));
+        assert!(content.contains("**Project-Alpha-Codex** — `codex`"));
     }
 }
