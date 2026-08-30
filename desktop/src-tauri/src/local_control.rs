@@ -187,7 +187,9 @@ async fn start_agent(
     authorize(&headers, &state.token)?;
     require_approval(request.approve)?;
     let app_state = state.app.state::<AppState>();
-    let agent = start_managed_agent(pubkey, state.app.clone(), app_state)
+    // Loopback control has no captured tenant scope: it acts on whatever
+    // community is active, so the scope/signer guards stay unscoped (None).
+    let agent = start_managed_agent(pubkey, None, None, state.app.clone(), app_state)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(json!({ "ok": true, "agent": agent })))
@@ -219,7 +221,9 @@ async fn restart_agent(
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     let app_state = state.app.state::<AppState>();
-    let agent = start_managed_agent(pubkey, state.app.clone(), app_state)
+    // Loopback control has no captured tenant scope: it acts on whatever
+    // community is active, so the scope/signer guards stay unscoped (None).
+    let agent = start_managed_agent(pubkey, None, None, state.app.clone(), app_state)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     Ok(Json(json!({ "ok": true, "agent": agent })))
@@ -284,9 +288,16 @@ async fn add_local_members(
     authorize(&headers, &state.token)?;
     require_approval(request.approve)?;
     let app_state = state.app.state::<AppState>();
-    let result = add_channel_members(channel_id, request.pubkeys, request.role, app_state)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
+    let result = add_channel_members(
+        channel_id,
+        request.pubkeys,
+        request.role,
+        None,
+        None,
+        app_state,
+    )
+    .await
+    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     let ok = result
         .get("errors")
         .and_then(Value::as_array)
