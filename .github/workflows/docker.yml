@@ -89,7 +89,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'onlyarag-linux-x64-docker' }}
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -200,7 +200,7 @@ jobs:
   merge:
     name: Merge multi-arch manifest
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: onlyarag-linux-x64-docker
     needs: build
     timeout-minutes: 15
     permissions:
@@ -315,7 +315,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'onlyarag-linux-x64-docker' }}
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -383,7 +383,7 @@ jobs:
   push-gateway-merge:
     name: Publish public push gateway image
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: onlyarag-linux-x64-docker
     needs: push-gateway-build
     timeout-minutes: 15
     permissions:
