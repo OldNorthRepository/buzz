@@ -20,7 +20,7 @@ env:
   CHART_REPO: oci://ghcr.io/block/buzz/charts
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || 'onlyarag-linux-x64' }}
     permissions: { contents: read }
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -34,7 +34,7 @@ jobs:
   publish:
     if: github.event_name != 'pull_request'
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: onlyarag-linux-x64-docker
     permissions:
       contents: read
       packages: write
