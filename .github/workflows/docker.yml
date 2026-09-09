@@ -89,7 +89,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'onlyarag-linux-x64-docker' }}
+            runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'onlyarag-linux-x64-docker' }}
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -315,7 +315,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'onlyarag-linux-x64-docker' }}
+            runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'onlyarag-linux-x64-docker' }}
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
