@@ -4519,7 +4519,6 @@ fn try_native_steer(
 
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
-/// Flush queued work to available agents.
 /// Number of local ACP slots this harness supervises. Gateway mode owns no
 /// local agent processes — the daemon spawns workers — so its slot count is
 /// zero and the maintenance sweep must never try to refill one.
@@ -4550,6 +4549,7 @@ mod local_slot_count_tests {
     }
 }
 
+/// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
