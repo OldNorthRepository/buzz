@@ -17,8 +17,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gateway_api::client::{ClientError, ControlClient, Endpoint};
-use gateway_api::protocol::SubmitJobRequest;
+use crate::legacy_gateway_api::{ClientError, ControlClient, Endpoint, SubmitJobRequest};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -74,9 +73,11 @@ pub trait TurnExecutor: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum GatewayExecutorError {
+pub(crate) enum GatewayExecutorError {
     #[error("gateway connection failed: {0}")]
     Connect(#[from] ClientError),
+    #[error("shared gateway connection failed: {0}")]
+    Shared(String),
     #[error("gateway has no route '{0}' — create it with `agent-gateway routes set` first")]
     RouteMissing(String),
     #[error("gateway read route '{route}' uses permission profile '{profile}', expected 'repository_read'")]
@@ -99,7 +100,7 @@ pub(crate) struct GatewayTurnDone {
 
 /// Turn executor backed by a host agent-gateway daemon.
 pub struct GatewayExecutor {
-    client: ControlClient,
+    client: GatewayConnection,
     /// Default route for channels with no explicit or auto mapping.
     route_id: String,
     /// Explicit read-only channel -> route overrides from configuration.
@@ -117,9 +118,16 @@ pub struct GatewayExecutor {
     /// turn_id -> gateway job id, for cancellation. Entries are removed when
     /// a turn reaches a terminal outcome.
     jobs: Mutex<HashMap<String, String>>,
+    /// Shared turns retain their attachment for stop and reconnect.
+    shared_stops: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     /// session scope -> in-flight turn_id, for scope-exact `!cancel` routing.
-    in_flight: Mutex<HashMap<SessionScope, String>>,
+    in_flight: std::sync::Mutex<HashMap<SessionScope, String>>,
     notify: tokio::sync::mpsc::UnboundedSender<GatewayTurnDone>,
+}
+
+enum GatewayConnection {
+    Legacy(ControlClient),
+    Shared(std::path::PathBuf),
 }
 
 fn explicit_route_for(
@@ -138,7 +146,7 @@ fn explicit_route_for(
 }
 
 fn existing_auto_route_matches(
-    route: &gateway_api::protocol::RouteView,
+    route: &crate::legacy_gateway_api::RouteView,
     channel_id: Uuid,
     expected_workspace: &std::path::Path,
 ) -> bool {
@@ -176,6 +184,33 @@ impl GatewayExecutor {
         config: GatewayBackendConfig,
     ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<GatewayTurnDone>), GatewayExecutorError>
     {
+        if config.shared {
+            let mut connection =
+                crate::shared_gateway::Connection::open(&config.socket, &config.route_id)
+                    .await
+                    .map_err(|error| GatewayExecutorError::Shared(error.to_string()))?;
+            connection
+                .request(serde_json::json!({"op":"route_session"}))
+                .await
+                .map_err(|error| GatewayExecutorError::Shared(error.to_string()))?;
+            let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
+            return Ok((
+                Self {
+                    client: GatewayConnection::Shared(config.socket),
+                    agent_id: String::new(),
+                    route_id: config.route_id,
+                    channel_routes: HashMap::new(),
+                    write_channel_routes: HashMap::new(),
+                    auto_route: None,
+                    resolved_routes: Mutex::new(HashMap::new()),
+                    jobs: Mutex::new(HashMap::new()),
+                    shared_stops: std::sync::Mutex::new(HashMap::new()),
+                    in_flight: std::sync::Mutex::new(HashMap::new()),
+                    notify,
+                },
+                done_rx,
+            ));
+        }
         let client = ControlClient::connect(Endpoint::Socket(config.socket)).await?;
         client.status().await?;
         let routes = client.routes().await?;
@@ -227,7 +262,7 @@ impl GatewayExecutor {
         let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok((
             Self {
-                client,
+                client: GatewayConnection::Legacy(client),
                 agent_id: default_route.agent_id.clone(),
                 route_id: config.route_id,
                 channel_routes: config.channel_routes,
@@ -235,7 +270,8 @@ impl GatewayExecutor {
                 auto_route: config.auto_route,
                 resolved_routes: Mutex::new(HashMap::new()),
                 jobs: Mutex::new(HashMap::new()),
-                in_flight: Mutex::new(HashMap::new()),
+                shared_stops: std::sync::Mutex::new(HashMap::new()),
+                in_flight: std::sync::Mutex::new(HashMap::new()),
                 notify,
             },
             done_rx,
@@ -287,7 +323,10 @@ impl GatewayExecutor {
             return None;
         }
         let route_id = format!("ch-{slug}");
-        match self.client.routes().await {
+        let GatewayConnection::Legacy(client) = &self.client else {
+            return None;
+        };
+        match client.routes().await {
             Ok(routes) => {
                 if let Some(route) = routes.routes.iter().find(|route| route.id == route_id) {
                     let expected_workspace = std::fs::canonicalize(&workspace).ok();
@@ -310,7 +349,7 @@ impl GatewayExecutor {
                 return None;
             }
         }
-        let request = gateway_api::protocol::SetRouteRequest {
+        let request = crate::legacy_gateway_api::SetRouteRequest {
             id: route_id.clone(),
             agent_id: self.agent_id.clone(),
             contexts: vec![channel_id.to_string()],
@@ -324,7 +363,7 @@ impl GatewayExecutor {
             agent_concurrency: None,
             env_allowlist: std::collections::BTreeMap::new(),
         };
-        match self.client.set_route(request).await {
+        match client.set_route(request).await {
             Ok(_) => {
                 tracing::info!(
                     channel = %channel_id, route = %route_id, workspace = %workspace.display(),
@@ -352,31 +391,71 @@ impl GatewayExecutor {
         ctx: std::sync::Arc<PromptContext>,
     ) -> String {
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let payload = encode_turn_payload(&batch);
+        let shared_receiver = if matches!(self.client, GatewayConnection::Shared(_)) {
+            let (stop, receiver) = tokio::sync::watch::channel(false);
+            if let Ok(mut stops) = self.shared_stops.lock() {
+                stops.insert(turn_id.clone(), stop);
+            }
+            Some(receiver)
+        } else {
+            None
+        };
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.insert(batch.scope.clone(), turn_id.clone());
+        }
         let executor = std::sync::Arc::clone(self);
         let id = turn_id.clone();
         tokio::spawn(async move {
             let channel_id = batch.channel_id;
             let scope = batch.scope.clone();
-            let channel_name = ctx
-                .channel_info
-                .resolve(channel_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|info| info.name);
-            let (route, write_capable) = executor
-                .route_for(channel_id, channel_name.as_deref())
-                .await;
-            executor
-                .in_flight
-                .lock()
-                .await
-                .insert(scope.clone(), id.clone());
-            let outcome = executor
-                .run_turn_on(&route, write_capable, &scope, &id, payload, None)
-                .await;
-            executor.in_flight.lock().await.remove(&scope);
+            let outcome = match &executor.client {
+                GatewayConnection::Shared(path) => {
+                    let outcome = match shared_receiver {
+                        Some(receiver) => {
+                            crate::shared_gateway::run(
+                                path,
+                                &executor.route_id,
+                                &batch,
+                                &ctx,
+                                receiver,
+                            )
+                            .await
+                        }
+                        None => TurnOutcome::Failed {
+                            reason: "shared stop channel missing".into(),
+                        },
+                    };
+                    if let Ok(mut stops) = executor.shared_stops.lock() {
+                        stops.remove(&id);
+                    }
+                    outcome
+                }
+                GatewayConnection::Legacy(_) => {
+                    let channel_name = ctx
+                        .channel_info
+                        .resolve(channel_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|info| info.name);
+                    let (route, write_capable) = executor
+                        .route_for(channel_id, channel_name.as_deref())
+                        .await;
+                    executor
+                        .run_turn_on(
+                            &route,
+                            write_capable,
+                            &scope,
+                            &id,
+                            encode_turn_payload(&batch),
+                            None,
+                        )
+                        .await
+                }
+            };
+            if let Ok(mut in_flight) = executor.in_flight.lock() {
+                in_flight.remove(&scope);
+            }
             let _ = executor.notify.send(GatewayTurnDone {
                 channel_id,
                 turn_id: id,
@@ -392,7 +471,11 @@ impl GatewayExecutor {
     /// running). Completion still arrives through the done channel (the job
     /// resolves to canceled/reconciling and the poll loop reports it).
     pub(crate) async fn cancel_scope(&self, scope: &SessionScope) -> bool {
-        let turn = self.in_flight.lock().await.get(scope).cloned();
+        let turn = self
+            .in_flight
+            .lock()
+            .ok()
+            .and_then(|in_flight| in_flight.get(scope).cloned());
         match turn {
             Some(turn_id) => self.cancel_turn(&turn_id).await,
             None => false,
@@ -433,6 +516,11 @@ impl GatewayExecutor {
         payload: serde_json::Value,
         timeout_ms: Option<i64>,
     ) -> TurnOutcome {
+        let GatewayConnection::Legacy(client) = &self.client else {
+            return TurnOutcome::Failed {
+                reason: "legacy job submission on shared connection".into(),
+            };
+        };
         let (permission_profile, side_effect_class) = gateway_job_policy(write_capable);
         let request = SubmitJobRequest {
             route_id: Some(route_id.to_owned()),
@@ -453,7 +541,7 @@ impl GatewayExecutor {
             idempotency_key: Some(turn_id.to_string()),
             source_id: None,
         };
-        let submitted = match self.client.submit(request).await {
+        let submitted = match client.submit(request).await {
             Ok(response) => response,
             Err(error) => {
                 // The daemon may have durably admitted the idempotent job before
@@ -472,7 +560,7 @@ impl GatewayExecutor {
         let mut consecutive_failures = 0u32;
         let outcome = loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            match self.client.job(&submitted.job_id).await {
+            match client.job(&submitted.job_id).await {
                 Ok(job) => {
                     consecutive_failures = 0;
                     if let Some(outcome) = map_job_state(
@@ -515,9 +603,20 @@ impl TurnExecutor for GatewayExecutor {
     }
 
     async fn cancel_turn(&self, turn_id: &str) -> bool {
+        if let GatewayConnection::Shared(_) = &self.client {
+            return self
+                .shared_stops
+                .lock()
+                .ok()
+                .and_then(|stops| stops.get(turn_id).cloned())
+                .is_some_and(|stop| stop.send(true).is_ok());
+        }
+        let GatewayConnection::Legacy(client) = &self.client else {
+            return false;
+        };
         let job_id = self.jobs.lock().await.get(turn_id).cloned();
         match job_id {
-            Some(job_id) => self.client.cancel(&job_id).await.is_ok(),
+            Some(job_id) => client.cancel(&job_id).await.is_ok(),
             None => false,
         }
     }
@@ -645,18 +744,13 @@ mod tests {
         channel: Uuid,
         profile: &str,
         workspace: &str,
-    ) -> gateway_api::protocol::RouteView {
-        gateway_api::protocol::RouteView {
+    ) -> crate::legacy_gateway_api::RouteView {
+        crate::legacy_gateway_api::RouteView {
             id: "ch-repo".into(),
             agent_id: "agent".into(),
             contexts: vec![channel.to_string()],
-            runtime: "runtime".into(),
-            model: None,
             workspace_path: workspace.into(),
-            workspace_id: "ino:1".into(),
-            session_mode: "thread".into(),
             permission_profile: profile.into(),
-            generation: 1,
         }
     }
 

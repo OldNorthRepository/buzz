@@ -58,6 +58,8 @@ pub enum ExecutionBackend {
     /// Submit turns as jobs to a host agent-gateway daemon (spike; see
     /// `turn_executor`).
     Gateway,
+    /// Use daemon-owned Claude/Codex sessions over AGW-SHARED/1.
+    Shared,
 }
 
 /// Resolved settings for `ExecutionBackend::Gateway`.
@@ -65,6 +67,8 @@ pub enum ExecutionBackend {
 pub struct GatewayBackendConfig {
     /// Unix socket of the agent-gateway control API.
     pub socket: PathBuf,
+    /// Select the AGW-SHARED/1 socket instead of the legacy control API.
+    pub shared: bool,
     /// Default route for channels with no explicit or auto mapping.
     pub route_id: String,
     /// Explicit read-only channel -> route overrides.
@@ -100,9 +104,17 @@ pub fn resolve_gateway_backend_full(
     }
     let (Some(socket), Some(route_id)) = (socket, route_id.filter(|r| !r.trim().is_empty())) else {
         return Err(ConfigError::Gateway(
-            "backend=gateway requires both --gateway-socket and --gateway-route".into(),
+            "gateway or shared backend requires both --gateway-socket and --gateway-route".into(),
         ));
     };
+    if backend == ExecutionBackend::Shared
+        && (!channel_route_pairs.is_empty() || auto_root.is_some() || auto_runtime.is_some())
+    {
+        return Err(ConfigError::Gateway(
+            "backend=shared uses one admitted route; channel and auto routes are unsupported"
+                .into(),
+        ));
+    }
     let mut channel_routes = std::collections::HashMap::new();
     for pair in channel_route_pairs {
         let pair = pair.trim();
@@ -153,6 +165,7 @@ pub fn resolve_gateway_backend_full(
     };
     Ok(Some(GatewayBackendConfig {
         socket,
+        shared: backend == ExecutionBackend::Shared,
         route_id,
         channel_routes,
         write_channel_routes: std::collections::HashMap::new(),
@@ -702,12 +715,12 @@ pub struct CliArgs {
     /// ignored (the watermark stays at startup time).
     #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
     pub replay_floor: Option<u64>,
-    /// Execution backend: `local` (in-process ACP subprocess pool) or
-    /// `gateway` (submit turns as jobs to a host agent-gateway daemon).
+    /// Execution backend: `local` (in-process ACP subprocess pool), `gateway`
+    /// (legacy gateway jobs), or `shared` (daemon-owned AGW-SHARED/1 sessions).
     #[arg(long, env = "BUZZ_ACP_BACKEND", value_enum, default_value_t = ExecutionBackend::Local)]
     pub backend: ExecutionBackend,
 
-    /// Unix socket of the agent-gateway control API (backend = gateway).
+    /// Unix socket of the gateway control API (`gateway`) or shared API (`shared`).
     #[arg(long, env = "BUZZ_ACP_GATEWAY_SOCKET")]
     pub gateway_socket: Option<PathBuf>,
 
@@ -1433,18 +1446,19 @@ impl Config {
             args.gateway_auto_route_runtime.clone(),
         )?;
         if let Some(gateway) = gateway.as_mut() {
+            if gateway.shared && !args.gateway_write_routes.is_empty() {
+                return Err(ConfigError::Gateway(
+                    "backend=shared does not accept legacy gateway write routes".into(),
+                ));
+            }
             gateway.write_channel_routes =
                 resolve_gateway_write_routes(&args.gateway_write_routes, &gateway.channel_routes)?;
         }
-        // GWP/0 has no mid-turn channel, so steer/interrupt cannot reach a
-        // gateway turn. Force queue-mode handling rather than silently
-        // accepting a mode the backend cannot honor (steering returns with
-        // GWP/1).
+        // Neither external backend accepts Buzz's local steer/interrupt mode.
+        // The shared backend supports explicit owner !cancel through its
+        // attachment, but a new Buzz event still queues behind the turn.
         if gateway.is_some() && args.multiple_event_handling != MultipleEventHandling::Queue {
-            tracing::warn!(
-                "backend=gateway forces --multiple-event-handling=queue \
-                 (steer/interrupt require a mid-turn channel the gateway does not have yet)"
-            );
+            tracing::warn!("external gateway backend forces --multiple-event-handling=queue");
             args.multiple_event_handling = MultipleEventHandling::Queue;
         }
 
@@ -1528,8 +1542,9 @@ impl Config {
         let gateway_detail = self.gateway.as_ref().map_or_else(
             || " backend=local".to_string(),
             |gateway| {
+                let backend = if gateway.shared { "shared" } else { "gateway" };
                 format!(
-                    " backend=gateway read_routes={} write_routes={} auto_route={}",
+                    " backend={backend} read_routes={} write_routes={} auto_route={}",
                     gateway.channel_routes.len(),
                     gateway.write_channel_routes.len(),
                     gateway.auto_route.is_some(),

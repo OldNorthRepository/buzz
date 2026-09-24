@@ -2953,6 +2953,7 @@ pub async fn run_prompt_task(
         crate::queue::format_prompt(
             b,
             &crate::queue::FormatPromptArgs {
+                harness_publishes_reply: false,
                 agent_core: standing.agent_core,
                 huddle_instructions: standing.huddle_instructions,
                 channel_info: channel_info.as_ref(),

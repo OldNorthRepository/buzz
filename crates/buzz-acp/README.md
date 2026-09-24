@@ -306,6 +306,25 @@ Each channel has at most one prompt in flight. Multiple channels can be processe
 
 > **Note:** On startup, the harness replays all unprocessed @mentions since the last run. Expect a burst of activity if there are stale events in the channel.
 
+### Shared gateway backend
+
+For a daemon-owned Claude or Codex session, configure `BUZZ_ACP_BACKEND=shared`,
+`BUZZ_ACP_GATEWAY_SOCKET` to the gateway's **shared** Unix socket, and
+`BUZZ_ACP_GATEWAY_ROUTE` to the Buzz ingress route admitted for that agent.
+Run one Buzz identity per process and give each identity its own admitted route.
+The existing `gateway` backend continues to use the legacy control socket.
+
+The shared backend derives a stable submission ID from the queued Buzz event
+IDs, looks up that ID before submitting, and never resubmits after a lost
+acknowledgment. It attaches to the daemon's ACP stream, reconnects by task ID
+and sequence, and sends an owner's `!cancel` through the active attachment.
+It collects streamed text into one threaded Buzz reply after the turn completes.
+Permission requests are canceled because Buzz has no interactive approval UI
+for this backend. A missed stream segment or uncertain relay publish is
+reported for operator reconciliation; the harness does not replay the prompt
+or publish a guessed reply. Keep the old Buzz consumer disabled when enabling
+its replacement so one identity has one subscriber.
+
 ## Bring Your Own Harness (BYOH)
 
 Buzz Desktop supports registering any ACP-speaking agent tool as a selectable runtime without a PR.
