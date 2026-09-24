@@ -168,14 +168,18 @@ async fn prompt(batch: &FlushBatch, ctx: &PromptContext) -> String {
         .await
         .ok()
         .flatten();
+    let base_prompt = ctx.base_prompt.as_deref().map(|base| {
+        if let Some(suffix) = base.strip_prefix(include_str!("base_prompt.md")) {
+            format!("{}{}", include_str!("base_prompt_shared.md"), suffix)
+        } else {
+            format!("{base}\n\nThe Buzz harness publishes your ACP response. Do not call `buzz messages send` for this reply.")
+        }
+    });
     let mut sections = crate::queue::format_prompt(
         batch,
         &FormatPromptArgs {
             channel_info: channel.as_ref(),
-            // The normal Buzz base prompt explicitly commands the agent to
-            // publish through buzz CLI. This backend owns publication, so
-            // carrying that standing context would risk a duplicate reply.
-            base_prompt: None,
+            base_prompt: base_prompt.as_deref(),
             system_prompt: ctx.system_prompt.as_deref(),
             team_instructions: ctx.team_instructions.as_deref(),
             harness_publishes_reply: true,
@@ -339,7 +343,14 @@ pub(crate) async fn run(
                 .await
             {
                 Ok(result) if result["claimed"] == true => {}
-                _ => continue,
+                _ => {
+                    // The task may have finished between the state read and
+                    // reclaim. Keep consuming the replay already attached.
+                    match task_state(&mut connection, &task).await {
+                        Ok(state) if terminal(&state).is_some() => {}
+                        _ => continue,
+                    }
+                }
             }
         }
         if *stop.borrow()
