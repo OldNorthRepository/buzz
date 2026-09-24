@@ -198,6 +198,7 @@ pub struct FlushBatch {
 /// ```
 pub struct EventQueue {
     queues: HashMap<SessionScope, VecDeque<QueuedEvent>>,
+    max_batch_events: usize,
     in_flight_scopes: HashSet<SessionScope>,
     /// Per-scope deadline for auto-expiring stuck in-flight entries.
     in_flight_deadlines: HashMap<SessionScope, Instant>,
@@ -241,6 +242,7 @@ impl EventQueue {
     pub fn new(dedup_mode: DedupMode) -> Self {
         Self {
             queues: HashMap::new(),
+            max_batch_events: MAX_BATCH_EVENTS,
             in_flight_scopes: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
@@ -252,6 +254,13 @@ impl EventQueue {
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
         }
+    }
+
+    /// Limit a flush to one event for a durable external submission identity.
+    /// The shared gateway backend uses the relay event ID as its retry key.
+    pub fn with_single_event_batches(mut self) -> Self {
+        self.max_batch_events = 1;
+        self
     }
 
     /// Set the in-flight backstop deadline from the configured max turn
@@ -450,7 +459,7 @@ impl EventQueue {
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
         let queue = self.queues.entry(scope.clone()).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
+        let drain_count = self.max_batch_events.min(queue.len());
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
             .map(|qe| BatchEvent {

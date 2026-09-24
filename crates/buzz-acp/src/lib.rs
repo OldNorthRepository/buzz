@@ -14,6 +14,7 @@ mod queue;
 mod relay;
 mod scope;
 mod setup_mode;
+mod shared_gateway;
 pub mod turn_executor;
 mod usage;
 
@@ -2780,6 +2781,13 @@ async fn tokio_main() -> Result<()> {
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    if config
+        .gateway
+        .as_ref()
+        .is_some_and(|gateway| gateway.shared)
+    {
+        queue = queue.with_single_event_batches();
+    }
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
