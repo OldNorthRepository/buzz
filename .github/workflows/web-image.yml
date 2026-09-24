@@ -1,0 +1,118 @@
+name: Web image
+
+# Builds the static buzz-web bundle (Dockerfile.web: web/ only, nginx, no
+# relay) and pushes it to GHCR for the OnlyArag staging host (staging.ts).
+#
+#   push to main       -> <image>:<40-hex sha> + <image>:main
+#   workflow_dispatch  -> <image>:<40-hex sha> of the dispatched ref
+#   pull_request       -> build only, never pushed
+#
+# Auth is the job's GITHUB_TOKEN with packages: write; no PAT. The image name
+# defaults to ghcr.io/<lower-case owner>/buzz-web; set the repository variable
+# GHCR_WEB_IMAGE to override. A package created this way is private until its
+# visibility is changed in the package settings — that is deliberate.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "Dockerfile.web"
+      - ".dockerignore"
+      - "deploy/web/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "patches/**"
+      - ".github/workflows/web-image.yml"
+  pull_request:
+    paths:
+      - "web/**"
+      - "Dockerfile.web"
+      - ".dockerignore"
+      - "deploy/web/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "patches/**"
+      - ".github/workflows/web-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: web-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build buzz-web image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve image name
+        id: img
+        env:
+          OVERRIDE: ${{ vars.GHCR_WEB_IMAGE }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          image="${OVERRIDE:-ghcr.io/${OWNER,,}/buzz-web}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
+        with:
+          images: ${{ steps.img.outputs.image }}
+          labels: |
+            org.opencontainers.image.title=buzz-web
+            org.opencontainers.image.description=Static Buzz web bundle (no relay)
+          tags: |
+            type=sha,format=long,prefix=
+            type=raw,value=main,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile.web
+          platforms: linux/amd64
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=buzz-web
+          cache-to: type=gha,scope=buzz-web,mode=max
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUSHED: ${{ github.event_name != 'pull_request' }}
+        run: |
+          {
+            echo "### buzz-web image"
+            echo "- ref: \`${IMAGE}:${GITHUB_SHA}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- pushed: ${PUSHED}"
+          } >> "$GITHUB_STEP_SUMMARY"

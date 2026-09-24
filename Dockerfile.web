@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1.7
+#
+# Static buzz-web bundle only — no relay, no datastore. Built by
+# .github/workflows/web-image.yml and published as
+# ghcr.io/oldnorthrepository/buzz-web:<sha> for the OnlyArag staging host.
+#
+# The web-builder stage mirrors the one in ./Dockerfile (same Node base, same
+# frozen pnpm install) but installs and builds only `buzz-web`. The runtime is
+# unprivileged nginx serving the bundle on :8080 with an SPA fallback, so the
+# TanStack Router client routes (/, /repos, /invite/<code>) all resolve to
+# index.html. Relay-backed calls (/api/*, the WebSocket) fail in this image by
+# design: it exists to verify the bundle, not the relay.
+
+ARG NODE_VERSION=24
+ARG DEBIAN_VERSION=bookworm
+ARG NGINX_VERSION=1.29-alpine
+
+FROM node:${NODE_VERSION}-${DEBIAN_VERSION}-slim AS web-builder
+WORKDIR /build
+RUN corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches/ patches/
+COPY web/package.json web/
+RUN pnpm install --frozen-lockfile --filter buzz-web
+COPY web/ web/
+RUN pnpm -C web build
+
+FROM nginxinc/nginx-unprivileged:${NGINX_VERSION} AS runtime
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="buzz-web" \
+      org.opencontainers.image.description="Static Buzz web bundle (no relay)" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="${GIT_SHA}"
+USER root
+COPY --chmod=0644 deploy/web/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=web-builder /build/web/dist /usr/share/nginx/html
+RUN printf "%s\n" "${GIT_SHA}" > /usr/share/nginx/html/version.txt \
+    && chmod -R a+rX /usr/share/nginx/html
+USER 101
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1
