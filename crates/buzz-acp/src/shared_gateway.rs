@@ -161,7 +161,7 @@ async fn read_line(stream: &mut UnixStream, limit: usize) -> io::Result<Vec<u8>>
     }
 }
 
-async fn prompt(batch: &FlushBatch, ctx: &PromptContext) -> String {
+async fn prompt(batch: &FlushBatch, ctx: &PromptContext) -> Result<String, TurnOutcome> {
     let channel = ctx
         .channel_info
         .resolve(batch.channel_id)
@@ -170,11 +170,15 @@ async fn prompt(batch: &FlushBatch, ctx: &PromptContext) -> String {
         .flatten();
     let base_prompt = ctx.base_prompt.as_deref().map(|base| {
         if let Some(suffix) = base.strip_prefix(include_str!("base_prompt.md")) {
-            format!("{}{}", include_str!("base_prompt_shared.md"), suffix)
+            Ok(format!("{}{}", include_str!("base_prompt_shared.md"), suffix))
+        } else if base.contains("buzz messages send") {
+            Err(TurnOutcome::Failed {
+                reason: "custom Buzz base prompt directs CLI message sending; supply a shared-safe base prompt".into(),
+            })
         } else {
-            format!("{base}\n\nThe Buzz harness publishes your ACP response. Do not call `buzz messages send` for this reply.")
+            Ok(format!("{base}\n\nThe Buzz harness publishes your ACP response. Do not call `buzz messages send` for this reply."))
         }
-    });
+    }).transpose()?;
     let mut sections = crate::queue::format_prompt(
         batch,
         &FormatPromptArgs {
@@ -187,7 +191,7 @@ async fn prompt(batch: &FlushBatch, ctx: &PromptContext) -> String {
         },
     );
     sections.push("Reply in your ACP response text. Buzz will publish your reply to the originating channel. Do not send a duplicate reply with the Buzz CLI.".into());
-    sections.join("\n\n")
+    Ok(sections.join("\n\n"))
 }
 
 fn task_id(value: &Value) -> Option<&str> {
@@ -243,7 +247,10 @@ pub(crate) async fn run(
     mut stop: watch::Receiver<bool>,
 ) -> TurnOutcome {
     let submission = submission_id(route, batch);
-    let prompt = prompt(batch, ctx).await;
+    let prompt = match prompt(batch, ctx).await {
+        Ok(prompt) => prompt,
+        Err(outcome) => return outcome,
+    };
     let mut may_have_submitted = false;
     let mut known_task: Option<String> = None;
     let mut cursor = 0u64;
@@ -327,7 +334,7 @@ pub(crate) async fn run(
             Ok(state) => state,
             Err(_) => continue,
         };
-        let already_terminal = terminal(&state).is_some();
+        let mut already_terminal = terminal(&state).is_some();
         if connection
             .request(json!({"op":"attach", "task_id":task, "after_sequence":cursor}))
             .await
@@ -347,7 +354,7 @@ pub(crate) async fn run(
                     // The task may have finished between the state read and
                     // reclaim. Keep consuming the replay already attached.
                     match task_state(&mut connection, &task).await {
-                        Ok(state) if terminal(&state).is_some() => {}
+                        Ok(state) if terminal(&state).is_some() => already_terminal = true,
                         _ => continue,
                     }
                 }
