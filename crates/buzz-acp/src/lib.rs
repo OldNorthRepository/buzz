@@ -5,6 +5,7 @@ mod config;
 mod engram_fetch;
 mod filter;
 mod gwp_worker;
+mod legacy_gateway_api;
 mod observer;
 mod pool;
 mod pool_lifecycle;

@@ -1863,6 +1863,8 @@ fn format_conversation_context(
 /// Arguments for [`format_prompt`] beyond the required [`FlushBatch`].
 #[derive(Default)]
 pub struct FormatPromptArgs<'a> {
+    /// The transport publishes the ACP text response, so omit CLI send advice.
+    pub harness_publishes_reply: bool,
     pub agent_core: Option<&'a str>,
     /// Owner-signed instructions for an active huddle channel.
     pub huddle_instructions: Option<&'a str>,
@@ -2068,7 +2070,9 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context,
             args.conversation_context_had_session_events,
         ),
-        reply_anchor.as_deref(),
+        (!args.harness_publishes_reply)
+            .then_some(reply_anchor.as_deref())
+            .flatten(),
     ));
 
     // 3. Conversation context (thread or DM).

@@ -172,9 +172,13 @@ async fn prompt(batch: &FlushBatch, ctx: &PromptContext) -> String {
         batch,
         &FormatPromptArgs {
             channel_info: channel.as_ref(),
-            base_prompt: ctx.base_prompt.as_deref(),
+            // The normal Buzz base prompt explicitly commands the agent to
+            // publish through buzz CLI. This backend owns publication, so
+            // carrying that standing context would risk a duplicate reply.
+            base_prompt: None,
             system_prompt: ctx.system_prompt.as_deref(),
             team_instructions: ctx.team_instructions.as_deref(),
+            harness_publishes_reply: true,
             ..FormatPromptArgs::default()
         },
     );
@@ -319,14 +323,7 @@ pub(crate) async fn run(
             Ok(state) => state,
             Err(_) => continue,
         };
-        if let Some(outcome) = terminal(&state) {
-            return match outcome {
-                TurnOutcome::Completed { .. } => TurnOutcome::UnknownOutcome {
-                    reason: "shared task completed before its transient reply could be attached; inspect Buzz and gateway before re-asking".into(),
-                },
-                other => other,
-            };
-        }
+        let already_terminal = terminal(&state).is_some();
         if connection
             .request(json!({"op":"attach", "task_id":task, "after_sequence":cursor}))
             .await
@@ -336,7 +333,7 @@ pub(crate) async fn run(
         }
         // The submitting connection already controls the task. Reclaim is
         // needed only after reconnect, once the previous connection detached.
-        if !submitted_here {
+        if !submitted_here && !already_terminal {
             match connection
                 .request(json!({"op":"reclaim", "task_id":task}))
                 .await
@@ -346,6 +343,7 @@ pub(crate) async fn run(
             }
         }
         if *stop.borrow()
+            && !already_terminal
             && connection
                 .request(json!({"op":"stop", "task_id":task}))
                 .await

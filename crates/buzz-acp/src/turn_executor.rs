@@ -17,8 +17,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gateway_api::client::{ClientError, ControlClient, Endpoint};
-use gateway_api::protocol::SubmitJobRequest;
+use crate::legacy_gateway_api::{ClientError, ControlClient, Endpoint, SubmitJobRequest};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -74,7 +73,7 @@ pub trait TurnExecutor: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum GatewayExecutorError {
+pub(crate) enum GatewayExecutorError {
     #[error("gateway connection failed: {0}")]
     Connect(#[from] ClientError),
     #[error("shared gateway connection failed: {0}")]
@@ -147,7 +146,7 @@ fn explicit_route_for(
 }
 
 fn existing_auto_route_matches(
-    route: &gateway_api::protocol::RouteView,
+    route: &crate::legacy_gateway_api::RouteView,
     channel_id: Uuid,
     expected_workspace: &std::path::Path,
 ) -> bool {
@@ -350,7 +349,7 @@ impl GatewayExecutor {
                 return None;
             }
         }
-        let request = gateway_api::protocol::SetRouteRequest {
+        let request = crate::legacy_gateway_api::SetRouteRequest {
             id: route_id.clone(),
             agent_id: self.agent_id.clone(),
             contexts: vec![channel_id.to_string()],
@@ -745,18 +744,13 @@ mod tests {
         channel: Uuid,
         profile: &str,
         workspace: &str,
-    ) -> gateway_api::protocol::RouteView {
-        gateway_api::protocol::RouteView {
+    ) -> crate::legacy_gateway_api::RouteView {
+        crate::legacy_gateway_api::RouteView {
             id: "ch-repo".into(),
             agent_id: "agent".into(),
             contexts: vec![channel.to_string()],
-            runtime: "runtime".into(),
-            model: None,
             workspace_path: workspace.into(),
-            workspace_id: "ino:1".into(),
-            session_mode: "thread".into(),
             permission_profile: profile.into(),
-            generation: 1,
         }
     }
 
