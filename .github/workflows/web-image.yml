@@ -18,6 +18,7 @@ on:
     paths:
       - "web/**"
       - "Dockerfile.web"
+      - ".dockerignore"
       - "deploy/web/**"
       - "package.json"
       - "pnpm-lock.yaml"
@@ -28,6 +29,7 @@ on:
     paths:
       - "web/**"
       - "Dockerfile.web"
+      - ".dockerignore"
       - "deploy/web/**"
       - "package.json"
       - "pnpm-lock.yaml"
@@ -81,9 +83,12 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
         with:
           images: ${{ steps.img.outputs.image }}
+          labels: |
+            org.opencontainers.image.title=buzz-web
+            org.opencontainers.image.description=Static Buzz web bundle (no relay)
           tags: |
             type=sha,format=long,prefix=
-            type=ref,event=branch
+            type=raw,value=main,enable={{is_default_branch}}
 
       - name: Build and push
         id: build
