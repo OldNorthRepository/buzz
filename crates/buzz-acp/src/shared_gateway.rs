@@ -397,16 +397,23 @@ pub(crate) async fn run(
                                 }
                                 reply.push_str(chunk);
                             }
-                            if frame["kind"] == "reverse_request" {
+                            if frame["kind"] == "reverse_request" && !already_terminal {
                                 if let Some(request_id) = frame["request_id"].as_str() {
                                     // Buzz has no interactive permission UI here. Cancel the
                                     // request; the gateway's Level C boundary stays authoritative.
                                     if frame.pointer("/payload/method").and_then(Value::as_str) == Some("session/request_permission") {
                                         if connection.request(json!({"op":"respond", "task_id":task,
                                             "request_id":request_id, "response":{"outcome":{"outcome":"cancelled"}}})).await.is_err() {
-                                            break;
+                                            match task_state(&mut connection, &task).await {
+                                                Ok(state) if terminal(&state).is_some() => already_terminal = true,
+                                                _ => break,
+                                            }
                                         }
                                     } else {
+                                        if matches!(task_state(&mut connection, &task).await, Ok(state) if terminal(&state).is_some()) {
+                                            already_terminal = true;
+                                            continue;
+                                        }
                                         let _ = connection.request(json!({"op":"stop", "task_id":task})).await;
                                         return TurnOutcome::UnknownOutcome { reason: "unsupported ACP reverse request; task stopped for reconciliation".into() };
                                     }
