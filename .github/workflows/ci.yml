@@ -540,6 +540,11 @@ jobs:
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+      - name: Tear down ephemeral integration fixtures
+        # Job-scoped CI fixtures: remove the Postgres/Redis/MinIO containers
+        # and their named volumes at job end so nothing persists on the runner.
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   desktop-e2e-integration:
     name: Desktop E2E Integration
@@ -698,6 +703,11 @@ jobs:
           name: backend-integration-relay-log
           path: /tmp/buzz-relay.log
           if-no-files-found: ignore
+      - name: Tear down ephemeral integration fixtures
+        # Job-scoped CI fixtures: remove the Postgres/Redis/MinIO containers
+        # and their named volumes at job end so nothing persists on the runner.
+        if: always()
+        run: docker compose down --volumes --remove-orphans
 
   relay-e2e:
     name: Relay E2E
