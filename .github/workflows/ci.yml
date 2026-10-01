@@ -45,6 +45,8 @@ jobs:
               - 'rust-toolchain.toml'
               - 'deny.toml'
               - '.github/workflows/ci.yml'
+              - 'docker-compose.yml'
+              - 'docker-compose.ci.yml'
               - 'scripts/run-tests.sh'
               - 'justfile'
             desktop:
@@ -366,6 +368,8 @@ jobs:
           retention-days: 1
 
   desktop-e2e-integration-shard:
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
     name: Desktop E2E Integration (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -564,6 +568,8 @@ jobs:
           echo "Desktop E2E Integration shards passed"
 
   backend-integration:
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -710,6 +716,8 @@ jobs:
         run: docker compose down --volumes --remove-orphans
 
   relay-e2e:
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
     name: Relay E2E
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1025,14 +1033,14 @@ jobs:
           touch "desktop/src-tauri/binaries/buzz-dev-mcp-$TARGET"
           touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
           touch "desktop/src-tauri/binaries/buzz-$TARGET"
-      # Mesh rev is derived from Cargo.lock so a dependency bump needs no
+      # Mesh rev is derived from the desktop lockfile so a dependency bump needs no
       # lockstep edit here; the cache key tracks it automatically.
       - name: Resolve mesh-llm rev
         id: mesh_rev
         run: |
           set -euo pipefail
-          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
-          [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from Cargo.lock"; exit 1; }
+          REV=$(python3 -c 'import tomllib; d=tomllib.load(open("desktop/src-tauri/Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+          [[ -n "$REV" ]] || { echo "::error::could not resolve mesh-llm rev from desktop/src-tauri/Cargo.lock"; exit 1; }
           echo "rev=$REV" >> "$GITHUB_OUTPUT"
           echo "short=${REV:0:7}" >> "$GITHUB_OUTPUT"
       - name: Restore mesh llama build cache
