@@ -1,0 +1,11 @@
+# CI pulls the published image; only the upstream MinIO image workflow builds it.
+# MINIO_CI_IMAGE allows reproducing a specific published image when needed.
+services:
+  minio:
+    image: ${MINIO_CI_IMAGE:-ghcr.io/block/buzz-minio:latest}
+    platform: linux/amd64
+    pull_policy: always
+  minio-init:
+    image: ${MINIO_CI_IMAGE:-ghcr.io/block/buzz-minio:latest}
+    platform: linux/amd64
+    pull_policy: always
