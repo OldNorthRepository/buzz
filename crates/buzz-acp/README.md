@@ -143,7 +143,7 @@ Controls which authors' events the harness forwards to the agent. Events from di
 | Mode | Behavior |
 |------|----------|
 | `owner-only` | Forward events from the agent's registered owner and its sibling agents (any agent whose profile carries an attestation from the same owner). If no owner is set, all events are dropped until the owner is resolved. |
-| `owner-strict` | Forward only events from the registered owner, in channels and DMs. Sibling agents are dropped, so a compromised sibling cannot hand this agent work. If no owner is set, all events are dropped. |
+| `owner-strict` | Forward only events the registered owner signed, in channels and DMs. Sibling agents are dropped, so a compromised sibling cannot hand this agent work. Relay-signed workflow messages are dropped too, because a trigger can carry another author's text. If no owner is set, all events are dropped. |
 | `allowlist` | Forward events from the listed pubkeys plus the owner. |
 | `anyone` | Forward all events (no author filtering). |
 | `nobody` | Drop all inbound events. Agent only acts on heartbeat prompts. |

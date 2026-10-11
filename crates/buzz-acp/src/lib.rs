@@ -513,8 +513,15 @@ mod inbound_author_gate {
             owner_cache: &OwnerCache,
             rest_client: &relay::RestClient,
         ) -> InboundAuthorGateDecision {
-            let effective_author =
-                effective_prompt_author(event, self.relay_self.as_deref(), &self.agent_pubkey_hex);
+            // Workflow attribution names the workflow's owner, but a trigger
+            // can carry another author's text into its message. Strict mode
+            // trusts only the raw signer, so an owner workflow cannot launder
+            // a sibling's post into an owner turn.
+            let effective_author = if matches!(respond_to, RespondTo::OwnerStrict) {
+                event.pubkey.to_hex()
+            } else {
+                effective_prompt_author(event, self.relay_self.as_deref(), &self.agent_pubkey_hex)
+            };
             let allowed = author_allowed(
                 respond_to,
                 allowlist,
@@ -7206,6 +7213,38 @@ mod author_gate_tests {
                 Self::Normal => "normal",
                 Self::Setup => "setup",
             }
+        }
+    }
+
+    /// Strict mode must not trust workflow attribution: a message-triggered
+    /// owner workflow could carry a sibling's text. Both production listeners
+    /// must drop a genuine relay-signed dispatch that names the owner.
+    #[tokio::test]
+    async fn production_listener_boundaries_ignore_workflow_owner_under_owner_strict() {
+        for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let owner = nostr::Keys::generate().public_key().to_hex();
+            let (attributed, allowed) = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::OwnerStrict,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                !allowed && attributed.is_none(),
+                "{} listener must drop an owner-attributed workflow under owner-strict",
+                listener.name()
+            );
         }
     }
 

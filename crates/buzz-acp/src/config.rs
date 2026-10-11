@@ -314,8 +314,9 @@ pub enum MultipleEventHandling {
 
 /// Inbound author gate: which authors' events the harness forwards to the agent.
 ///
-/// - `owner-only` — only the agent's registered owner (default).
-/// - `owner-strict` — the owner alone, in channels and DMs; never siblings.
+/// - `owner-only` — the agent's registered owner and its sibling agents (default).
+/// - `owner-strict` — the owner alone, as raw signer, in channels and DMs; never
+///   siblings or owner-attributed workflow messages.
 /// - `allowlist`  — owner + explicit pubkey list (`--respond-to-allowlist`).
 /// - `anyone`     — all events forwarded (no author filtering).
 /// - `nobody`     — all events dropped (proactive/heartbeat-only mode).
@@ -492,7 +493,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub gwp_worker: bool,
 
-    /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
+    /// Agent owner pubkey (64-char hex). Used by the owner-only and owner-strict gates.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
     pub agent_owner: Option<String>,
 
