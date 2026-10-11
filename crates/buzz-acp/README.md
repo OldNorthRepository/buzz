@@ -315,10 +315,10 @@ Run one Buzz identity per process and give each identity its own admitted route.
 The existing `gateway` backend continues to use the legacy control socket.
 
 Every shared submit declares the route's policy, and the daemon refuses a
-mismatch. Set `BUZZ_ACP_GATEWAY_PERMISSION_PROFILE` (`repository_read` or
-`restricted`) and `BUZZ_ACP_GATEWAY_SIDE_EFFECT_CLASS` (`pure_read` or
-`external_effects`) to exactly the values in the gateway's route
-configuration. The shared backend is read-only; write profiles fail at startup.
+mismatch. Set `BUZZ_ACP_GATEWAY_PERMISSION_PROFILE` (`repository_read`,
+`repository_write` or `restricted`) and `BUZZ_ACP_GATEWAY_SIDE_EFFECT_CLASS`
+(`pure_read`, `external_effects` or `workspace_write`) to exactly the values in
+the gateway's route configuration. Unknown values fail at startup.
 
 The shared backend derives a stable submission ID from the queued Buzz event
 IDs, looks up that ID before submitting, and never resubmits after a lost

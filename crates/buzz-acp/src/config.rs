@@ -185,8 +185,8 @@ pub fn resolve_gateway_backend_full(
     }))
 }
 
-/// `backend=shared` is read-only, like auto routes: write profiles and
-/// effects are refused here rather than by the daemon at the first turn. The
+/// Unknown values are refused here rather than by the daemon at the first
+/// turn; the daemon still checks that they equal the admitted route's. The
 /// legacy backend derives its policy per job, so it rejects these options.
 fn resolve_shared_policy(
     shared: bool,
@@ -214,16 +214,22 @@ fn resolve_shared_policy(
                 .into(),
         ));
     };
-    if !matches!(permission_profile, "repository_read" | "restricted") {
+    if !matches!(
+        permission_profile,
+        "repository_read" | "repository_write" | "restricted"
+    ) {
         return Err(ConfigError::Gateway(format!(
-            "backend=shared permission profile '{permission_profile}' is not read-only \
-             (expected repository_read or restricted)"
+            "unknown backend=shared permission profile '{permission_profile}' \
+             (expected repository_read, repository_write or restricted)"
         )));
     }
-    if !matches!(side_effect_class, "pure_read" | "external_effects") {
+    if !matches!(
+        side_effect_class,
+        "pure_read" | "external_effects" | "workspace_write"
+    ) {
         return Err(ConfigError::Gateway(format!(
-            "backend=shared side-effect class '{side_effect_class}' is not read-only \
-             (expected pure_read or external_effects)"
+            "unknown backend=shared side-effect class '{side_effect_class}' \
+             (expected pure_read, external_effects or workspace_write)"
         )));
     }
     Ok(Some(SharedPolicy {
@@ -808,12 +814,14 @@ pub struct CliArgs {
     pub gateway_auto_route_runtime: Option<String>,
 
     /// Permission profile each shared submit declares (backend = shared).
-    /// Must equal the admitted route's: `repository_read` or `restricted`.
+    /// Must equal the admitted route's: `repository_read`, `repository_write`
+    /// or `restricted`.
     #[arg(long, env = "BUZZ_ACP_GATEWAY_PERMISSION_PROFILE")]
     pub gateway_permission_profile: Option<String>,
 
     /// Side-effect class each shared submit declares (backend = shared).
-    /// Must equal the admitted route's: `pure_read` or `external_effects`.
+    /// Must equal the admitted route's: `pure_read`, `external_effects` or
+    /// `workspace_write`.
     #[arg(long, env = "BUZZ_ACP_GATEWAY_SIDE_EFFECT_CLASS")]
     pub gateway_side_effect_class: Option<String>,
 }
@@ -4099,15 +4107,17 @@ mod gateway_backend_tests {
     }
 
     #[test]
-    fn shared_policy_refuses_write_declarations() {
-        assert!(
-            resolve_shared_policy(true, Some("repository_write"), Some("external_effects"))
-                .is_err()
-        );
-        assert!(
-            resolve_shared_policy(true, Some("repository_read"), Some("workspace_write")).is_err()
+    fn shared_policy_accepts_write_routes_and_refuses_unknown_values() {
+        assert_eq!(
+            resolve_shared_policy(true, Some("repository_write"), Some("workspace_write")).unwrap(),
+            Some(SharedPolicy {
+                permission_profile: "repository_write".into(),
+                side_effect_class: "workspace_write".into(),
+            })
         );
         assert!(resolve_shared_policy(true, Some("restricted"), Some("pure_read")).is_ok());
+        assert!(resolve_shared_policy(true, Some("repo_write"), Some("workspace_write")).is_err());
+        assert!(resolve_shared_policy(true, Some("repository_read"), Some("writes")).is_err());
     }
 
     #[test]
