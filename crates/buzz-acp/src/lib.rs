@@ -384,6 +384,7 @@ mod inbound_author_gate {
         if is_dm {
             return match respond_to {
                 RespondTo::Nobody => false,
+                RespondTo::OwnerStrict => owner_cache.get() == Some(author),
                 _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
             };
         }
@@ -391,6 +392,11 @@ mod inbound_author_gate {
             RespondTo::Anyone => true,
             RespondTo::Nobody => false,
             RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
+            // Siblings are any agent carrying an attestation from the same
+            // owner, so one compromised sibling could hand work to another.
+            // Strict mode admits the owner alone; an unresolved owner admits
+            // nobody.
+            RespondTo::OwnerStrict => owner_cache.get() == Some(author),
             RespondTo::Allowlist => {
                 allowlist.contains(author)
                     || is_owner_or_sibling(author, owner_cache, rest_client).await
@@ -2652,10 +2658,11 @@ async fn tokio_main() -> Result<()> {
     // Warn if owner-dependent mode but no owner resolved yet.
     if startup_owner.is_none() {
         match &config.respond_to {
-            RespondTo::OwnerOnly => {
+            RespondTo::OwnerOnly | RespondTo::OwnerStrict => {
                 tracing::warn!(
-                    "respond-to=owner-only but no owner is set — all events will be \
-                     dropped. Set BUZZ_AUTH_TAG or --agent-owner, or use --respond-to=anyone."
+                    "respond-to={} but no owner is set — all events will be \
+                     dropped. Set BUZZ_AUTH_TAG or --agent-owner, or use --respond-to=anyone.",
+                    config.respond_to
                 );
             }
             RespondTo::Allowlist => {
@@ -8067,6 +8074,62 @@ mod author_gate_tests {
                 )
                 .await,
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_owner_strict_admits_only_the_owner() {
+        let cache = cache_with_sibling();
+        for is_dm in [false, true] {
+            assert!(
+                inbound_author_gate::test_author_allowed(
+                    &RespondTo::OwnerStrict,
+                    &HashSet::new(),
+                    OWNER,
+                    is_dm,
+                    &cache,
+                    &dummy_rest_client()
+                )
+                .await,
+                "owner-strict must admit the owner (dm={is_dm})"
+            );
+            for (who, label) in [
+                (SIBLING, "sibling"),
+                (STRANGER, "stranger"),
+                (EXTERNAL, "external"),
+            ] {
+                assert!(
+                    !inbound_author_gate::test_author_allowed(
+                        &RespondTo::OwnerStrict,
+                        &HashSet::from([EXTERNAL.to_string()]),
+                        who,
+                        is_dm,
+                        &cache,
+                        &dummy_rest_client()
+                    )
+                    .await,
+                    "owner-strict must drop the {label} (dm={is_dm})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_owner_strict_without_owner_admits_nobody() {
+        let cache = OwnerCache::new(None);
+        for is_dm in [false, true] {
+            assert!(
+                !inbound_author_gate::test_author_allowed(
+                    &RespondTo::OwnerStrict,
+                    &HashSet::new(),
+                    OWNER,
+                    is_dm,
+                    &cache,
+                    &dummy_rest_client()
+                )
+                .await,
+                "an unresolved owner must fail closed (dm={is_dm})"
             );
         }
     }

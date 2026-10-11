@@ -135,14 +135,15 @@ Controls which authors' events the harness forwards to the agent. Events from di
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `allowlist`, `anyone`, `nobody`. |
+| `--respond-to` | `BUZZ_ACP_RESPOND_TO` | `owner-only` | Author gate mode: `owner-only`, `owner-strict`, `allowlist`, `anyone`, `nobody`. |
 | `--respond-to-allowlist` | `BUZZ_ACP_RESPOND_TO_ALLOWLIST` | — | Comma-separated 64-char hex pubkeys (required when mode is `allowlist`). Owner is always implicitly included. |
 
 **Modes:**
 
 | Mode | Behavior |
 |------|----------|
-| `owner-only` | Forward only events from the agent's registered owner. If no owner is set, all events are dropped until the owner is resolved. |
+| `owner-only` | Forward events from the agent's registered owner and its sibling agents (any agent whose profile carries an attestation from the same owner). If no owner is set, all events are dropped until the owner is resolved. |
+| `owner-strict` | Forward only events from the registered owner, in channels and DMs. Sibling agents are dropped, so a compromised sibling cannot hand this agent work. If no owner is set, all events are dropped. |
 | `allowlist` | Forward events from the listed pubkeys plus the owner. |
 | `anyone` | Forward all events (no author filtering). |
 | `nobody` | Drop all inbound events. Agent only acts on heartbeat prompts. |
