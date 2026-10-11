@@ -21,6 +21,8 @@ on:
       - 'desktop/src-tauri/src/mesh_llm/**'
       - 'scripts/ci-mesh-lifecycle-smoke.sh'
       - 'scripts/start-relay-for-tests.sh'
+      - 'docker-compose.yml'
+      - 'docker-compose.ci.yml'
       - '.github/workflows/mesh-lifecycle.yml'
   pull_request:
     paths:
@@ -33,6 +35,8 @@ on:
       - 'desktop/src-tauri/src/mesh_llm/**'
       - 'scripts/ci-mesh-lifecycle-smoke.sh'
       - 'scripts/start-relay-for-tests.sh'
+      - 'docker-compose.yml'
+      - 'docker-compose.ci.yml'
       - '.github/workflows/mesh-lifecycle.yml'
   workflow_dispatch:
 
@@ -45,6 +49,8 @@ env:
 
 jobs:
   lifecycle-smoke:
+    env:
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
     name: Relay-Driven Mesh Lifecycle Smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 45
