@@ -356,7 +356,7 @@ pub(crate) async fn run(
                 }
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                     return TurnOutcome::Failed {
-                        reason: error.to_string(),
+                        reason: refused(&error),
                     };
                 }
                 Err(_) => continue,
@@ -493,6 +493,21 @@ pub(crate) async fn run(
         absent && !may_have_submitted && known_task.is_none(),
         busy,
     )
+}
+
+/// A route session whose policy binding differs from the route's refuses
+/// every submit. `route_session` is scoped by route generation, so raising
+/// it is the operator's way to start a fresh session.
+fn refused(error: &io::Error) -> String {
+    let reason = error.to_string();
+    if reason.ends_with(": session_policy_mismatch") {
+        format!(
+            "{reason}; the route's current session has a different policy binding, \
+             so raise its route_generation in the gateway config to start a fresh session"
+        )
+    } else {
+        reason
+    }
 }
 
 fn exhausted(submission: &str, not_admitted: bool, busy: bool) -> TurnOutcome {
@@ -686,6 +701,20 @@ mod tests {
             exhausted("buzz-1", true, false),
             TurnOutcome::Failed { reason } if reason.contains("not submitted")
         ));
+    }
+
+    #[test]
+    fn session_policy_refusal_names_the_operator_fix() {
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "shared gateway refused: session_policy_mismatch",
+        );
+        assert!(refused(&error).contains("route_generation"));
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "shared gateway refused: policy_mismatch",
+        );
+        assert_eq!(refused(&error), "shared gateway refused: policy_mismatch");
     }
 
     #[tokio::test]

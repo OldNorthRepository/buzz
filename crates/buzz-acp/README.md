@@ -330,7 +330,10 @@ for this backend. A missed stream segment or uncertain relay publish is
 reported for operator reconciliation; the harness does not replay the prompt
 or publish a guessed reply. A request the daemon provably never admitted, such
 as one still refused as `busy` at the turn deadline or refused by policy, is
-reported as failed rather than uncertain. Keep the old Buzz consumer disabled
+reported as failed rather than uncertain. A route session whose policy binding
+no longer matches the route (`session_policy_mismatch`) refuses every submit
+until the operator raises that route's `route_generation`. Keep the old Buzz
+consumer disabled
 when enabling its replacement so one identity has one subscriber.
 
 ## Bring Your Own Harness (BYOH)
