@@ -326,7 +326,8 @@ acknowledgment. It attaches to the daemon's ACP stream, reconnects by task ID
 and sequence, and sends an owner's `!cancel` through the active attachment.
 It collects streamed text into one threaded Buzz reply after the turn completes.
 Permission requests are canceled because Buzz has no interactive approval UI
-for this backend. A missed stream segment or uncertain relay publish is
+for this backend, so a write route edits files only when the gateway's agent
+command already runs without permission prompts. A missed stream segment or uncertain relay publish is
 reported for operator reconciliation; the harness does not replay the prompt
 or publish a guessed reply. A request the daemon provably never admitted, such
 as one still refused as `busy` at the turn deadline or refused by policy, is
