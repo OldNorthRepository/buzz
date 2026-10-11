@@ -896,7 +896,6 @@ dependencies = [
  "clap",
  "evalexpr",
  "futures-util",
- "gateway-api",
  "hex",
  "httparse",
  "nix 0.31.3",
@@ -3299,36 +3298,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "gateway-api"
-version = "0.1.0"
-source = "git+https://github.com/OldNorthRepository/agent-gateway.git?rev=4f16e23#4f16e2386af603a1bad1ae2ea41be9a7720ce296"
-dependencies = [
- "axum",
- "futures-util",
- "gateway-core",
- "getrandom 0.3.4",
- "nix 0.30.1",
- "serde",
- "serde_json",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "gateway-core"
-version = "0.1.0"
-source = "git+https://github.com/OldNorthRepository/agent-gateway.git?rev=4f16e23#4f16e2386af603a1bad1ae2ea41be9a7720ce296"
-dependencies = [
- "blake3",
- "serde",
- "thiserror 2.0.18",
- "uuid",
 ]
 
 [[package]]
@@ -6061,7 +6030,6 @@ dependencies = [
  "cfg-if 1.0.4",
  "cfg_aliases",
  "libc",
- "memoffset",
 ]
 
 [[package]]

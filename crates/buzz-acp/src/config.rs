@@ -58,6 +58,8 @@ pub enum ExecutionBackend {
     /// Submit turns as jobs to a host agent-gateway daemon (spike; see
     /// `turn_executor`).
     Gateway,
+    /// Use daemon-owned Claude/Codex sessions over AGW-SHARED/1.
+    Shared,
 }
 
 /// Resolved settings for `ExecutionBackend::Gateway`.
@@ -65,6 +67,8 @@ pub enum ExecutionBackend {
 pub struct GatewayBackendConfig {
     /// Unix socket of the agent-gateway control API.
     pub socket: PathBuf,
+    /// Select the AGW-SHARED/1 socket instead of the legacy control API.
+    pub shared: bool,
     /// Default route for channels with no explicit or auto mapping.
     pub route_id: String,
     /// Explicit read-only channel -> route overrides.
@@ -74,6 +78,17 @@ pub struct GatewayBackendConfig {
     pub write_channel_routes: std::collections::HashMap<uuid::Uuid, String>,
     /// Name-convention auto-routing, when enabled. Auto routes remain read-only.
     pub auto_route: Option<AutoRouteConfig>,
+    /// Policy every shared submit declares. Set exactly when `shared` is.
+    pub shared_policy: Option<SharedPolicy>,
+}
+
+/// The admitted route's permission profile and side-effect class. The shared
+/// daemon refuses a submit that declares anything else, so these must match
+/// the gateway's route configuration exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharedPolicy {
+    pub permission_profile: String,
+    pub side_effect_class: String,
 }
 
 /// A channel named `foo` maps to workspace `<root>/foo` (when the directory
@@ -100,9 +115,17 @@ pub fn resolve_gateway_backend_full(
     }
     let (Some(socket), Some(route_id)) = (socket, route_id.filter(|r| !r.trim().is_empty())) else {
         return Err(ConfigError::Gateway(
-            "backend=gateway requires both --gateway-socket and --gateway-route".into(),
+            "gateway or shared backend requires both --gateway-socket and --gateway-route".into(),
         ));
     };
+    if backend == ExecutionBackend::Shared
+        && (!channel_route_pairs.is_empty() || auto_root.is_some() || auto_runtime.is_some())
+    {
+        return Err(ConfigError::Gateway(
+            "backend=shared uses one admitted route; channel and auto routes are unsupported"
+                .into(),
+        ));
+    }
     let mut channel_routes = std::collections::HashMap::new();
     for pair in channel_route_pairs {
         let pair = pair.trim();
@@ -153,10 +176,59 @@ pub fn resolve_gateway_backend_full(
     };
     Ok(Some(GatewayBackendConfig {
         socket,
+        shared: backend == ExecutionBackend::Shared,
         route_id,
         channel_routes,
         write_channel_routes: std::collections::HashMap::new(),
         auto_route,
+        shared_policy: None,
+    }))
+}
+
+/// `backend=shared` is read-only, like auto routes: write profiles and
+/// effects are refused here rather than by the daemon at the first turn. The
+/// legacy backend derives its policy per job, so it rejects these options.
+fn resolve_shared_policy(
+    shared: bool,
+    permission_profile: Option<&str>,
+    side_effect_class: Option<&str>,
+) -> Result<Option<SharedPolicy>, ConfigError> {
+    let permission_profile = permission_profile.map(str::trim).filter(|v| !v.is_empty());
+    let side_effect_class = side_effect_class.map(str::trim).filter(|v| !v.is_empty());
+    if !shared {
+        if permission_profile.is_some() || side_effect_class.is_some() {
+            return Err(ConfigError::Gateway(
+                "--gateway-permission-profile and --gateway-side-effect-class apply only to \
+                 backend=shared"
+                    .into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let (Some(permission_profile), Some(side_effect_class)) =
+        (permission_profile, side_effect_class)
+    else {
+        return Err(ConfigError::Gateway(
+            "backend=shared requires --gateway-permission-profile and \
+             --gateway-side-effect-class matching the admitted route"
+                .into(),
+        ));
+    };
+    if !matches!(permission_profile, "repository_read" | "restricted") {
+        return Err(ConfigError::Gateway(format!(
+            "backend=shared permission profile '{permission_profile}' is not read-only \
+             (expected repository_read or restricted)"
+        )));
+    }
+    if !matches!(side_effect_class, "pure_read" | "external_effects") {
+        return Err(ConfigError::Gateway(format!(
+            "backend=shared side-effect class '{side_effect_class}' is not read-only \
+             (expected pure_read or external_effects)"
+        )));
+    }
+    Ok(Some(SharedPolicy {
+        permission_profile: permission_profile.to_owned(),
+        side_effect_class: side_effect_class.to_owned(),
     }))
 }
 
@@ -702,12 +774,12 @@ pub struct CliArgs {
     /// ignored (the watermark stays at startup time).
     #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
     pub replay_floor: Option<u64>,
-    /// Execution backend: `local` (in-process ACP subprocess pool) or
-    /// `gateway` (submit turns as jobs to a host agent-gateway daemon).
+    /// Execution backend: `local` (in-process ACP subprocess pool), `gateway`
+    /// (legacy gateway jobs), or `shared` (daemon-owned AGW-SHARED/1 sessions).
     #[arg(long, env = "BUZZ_ACP_BACKEND", value_enum, default_value_t = ExecutionBackend::Local)]
     pub backend: ExecutionBackend,
 
-    /// Unix socket of the agent-gateway control API (backend = gateway).
+    /// Unix socket of the gateway control API (`gateway`) or shared API (`shared`).
     #[arg(long, env = "BUZZ_ACP_GATEWAY_SOCKET")]
     pub gateway_socket: Option<PathBuf>,
 
@@ -734,6 +806,16 @@ pub struct CliArgs {
     /// Gateway runtime used for auto-created channel routes.
     #[arg(long, env = "BUZZ_ACP_GATEWAY_AUTO_ROUTE_RUNTIME")]
     pub gateway_auto_route_runtime: Option<String>,
+
+    /// Permission profile each shared submit declares (backend = shared).
+    /// Must equal the admitted route's: `repository_read` or `restricted`.
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_PERMISSION_PROFILE")]
+    pub gateway_permission_profile: Option<String>,
+
+    /// Side-effect class each shared submit declares (backend = shared).
+    /// Must equal the admitted route's: `pure_read` or `external_effects`.
+    #[arg(long, env = "BUZZ_ACP_GATEWAY_SIDE_EFFECT_CLASS")]
+    pub gateway_side_effect_class: Option<String>,
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
@@ -1433,18 +1515,24 @@ impl Config {
             args.gateway_auto_route_runtime.clone(),
         )?;
         if let Some(gateway) = gateway.as_mut() {
+            if gateway.shared && !args.gateway_write_routes.is_empty() {
+                return Err(ConfigError::Gateway(
+                    "backend=shared does not accept legacy gateway write routes".into(),
+                ));
+            }
             gateway.write_channel_routes =
                 resolve_gateway_write_routes(&args.gateway_write_routes, &gateway.channel_routes)?;
+            gateway.shared_policy = resolve_shared_policy(
+                gateway.shared,
+                args.gateway_permission_profile.as_deref(),
+                args.gateway_side_effect_class.as_deref(),
+            )?;
         }
-        // GWP/0 has no mid-turn channel, so steer/interrupt cannot reach a
-        // gateway turn. Force queue-mode handling rather than silently
-        // accepting a mode the backend cannot honor (steering returns with
-        // GWP/1).
+        // Neither external backend accepts Buzz's local steer/interrupt mode.
+        // The shared backend supports explicit owner !cancel through its
+        // attachment, but a new Buzz event still queues behind the turn.
         if gateway.is_some() && args.multiple_event_handling != MultipleEventHandling::Queue {
-            tracing::warn!(
-                "backend=gateway forces --multiple-event-handling=queue \
-                 (steer/interrupt require a mid-turn channel the gateway does not have yet)"
-            );
+            tracing::warn!("external gateway backend forces --multiple-event-handling=queue");
             args.multiple_event_handling = MultipleEventHandling::Queue;
         }
 
@@ -1528,8 +1616,9 @@ impl Config {
         let gateway_detail = self.gateway.as_ref().map_or_else(
             || " backend=local".to_string(),
             |gateway| {
+                let backend = if gateway.shared { "shared" } else { "gateway" };
                 format!(
-                    " backend=gateway read_routes={} write_routes={} auto_route={}",
+                    " backend={backend} read_routes={} write_routes={} auto_route={}",
                     gateway.channel_routes.len(),
                     gateway.write_channel_routes.len(),
                     gateway.auto_route.is_some(),
@@ -3968,5 +4057,63 @@ mod gateway_backend_tests {
             resolved.socket,
             PathBuf::from("/run/agent-gateway/control.sock")
         );
+    }
+
+    fn shared_args(policy: &[&str]) -> Result<Config, ConfigError> {
+        use clap::Parser;
+        let keys = nostr::Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let mut argv = vec![
+            "buzz-acp",
+            "--private-key",
+            &secret,
+            "--backend",
+            "shared",
+            "--gateway-socket",
+            "/run/agent-gateway/shared.sock",
+            "--gateway-route",
+            "rt-homelab-secrets-claude",
+        ];
+        argv.extend_from_slice(policy);
+        Config::from_args(CliArgs::try_parse_from(argv).unwrap())
+    }
+
+    #[test]
+    fn shared_backend_requires_declared_route_policy() {
+        assert!(shared_args(&[]).is_err());
+        assert!(shared_args(&["--gateway-permission-profile", "repository_read"]).is_err());
+        let config = shared_args(&[
+            "--gateway-permission-profile",
+            "repository_read",
+            "--gateway-side-effect-class",
+            "external_effects",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.gateway.and_then(|gateway| gateway.shared_policy),
+            Some(SharedPolicy {
+                permission_profile: "repository_read".into(),
+                side_effect_class: "external_effects".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn shared_policy_refuses_write_declarations() {
+        assert!(
+            resolve_shared_policy(true, Some("repository_write"), Some("external_effects"))
+                .is_err()
+        );
+        assert!(
+            resolve_shared_policy(true, Some("repository_read"), Some("workspace_write")).is_err()
+        );
+        assert!(resolve_shared_policy(true, Some("restricted"), Some("pure_read")).is_ok());
+    }
+
+    #[test]
+    fn legacy_gateway_rejects_shared_policy() {
+        assert_eq!(resolve_shared_policy(false, None, None).unwrap(), None);
+        assert!(resolve_shared_policy(false, Some("repository_read"), None).is_err());
+        assert!(resolve_shared_policy(false, None, Some("pure_read")).is_err());
     }
 }
