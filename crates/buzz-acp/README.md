@@ -314,6 +314,12 @@ For a daemon-owned Claude or Codex session, configure `BUZZ_ACP_BACKEND=shared`,
 Run one Buzz identity per process and give each identity its own admitted route.
 The existing `gateway` backend continues to use the legacy control socket.
 
+Every shared submit declares the route's policy, and the daemon refuses a
+mismatch. Set `BUZZ_ACP_GATEWAY_PERMISSION_PROFILE` (`repository_read` or
+`restricted`) and `BUZZ_ACP_GATEWAY_SIDE_EFFECT_CLASS` (`pure_read` or
+`external_effects`) to exactly the values in the gateway's route
+configuration. The shared backend is read-only; write profiles fail at startup.
+
 The shared backend derives a stable submission ID from the queued Buzz event
 IDs, looks up that ID before submitting, and never resubmits after a lost
 acknowledgment. It attaches to the daemon's ACP stream, reconnects by task ID
@@ -322,8 +328,10 @@ It collects streamed text into one threaded Buzz reply after the turn completes.
 Permission requests are canceled because Buzz has no interactive approval UI
 for this backend. A missed stream segment or uncertain relay publish is
 reported for operator reconciliation; the harness does not replay the prompt
-or publish a guessed reply. Keep the old Buzz consumer disabled when enabling
-its replacement so one identity has one subscriber.
+or publish a guessed reply. A request the daemon provably never admitted, such
+as one still refused as `busy` at the turn deadline or refused by policy, is
+reported as failed rather than uncertain. Keep the old Buzz consumer disabled
+when enabling its replacement so one identity has one subscriber.
 
 ## Bring Your Own Harness (BYOH)
 

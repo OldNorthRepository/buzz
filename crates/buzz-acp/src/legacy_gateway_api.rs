@@ -10,9 +10,23 @@ use std::time::Duration;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+// The gateway listens on a Unix socket. Other targets still compile the
+// client, but every call fails.
+#[cfg(unix)]
+async fn connect(path: &std::path::Path) -> io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+#[cfg(not(unix))]
+async fn connect(_path: &std::path::Path) -> io::Result<tokio::io::DuplexStream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the agent-gateway control API requires a Unix socket",
+    ))
+}
 
 pub(crate) enum Endpoint {
     Socket(PathBuf),
@@ -82,7 +96,7 @@ impl ControlClient {
             body.len()
         );
         let bytes = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut stream = UnixStream::connect(&self.path).await?;
+            let mut stream = connect(&self.path).await?;
             stream.write_all(request.as_bytes()).await?;
             stream.write_all(&body).await?;
             let mut response = Vec::new();

@@ -11,9 +11,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::sync::watch;
 
+use crate::config::SharedPolicy;
 use crate::pool::PromptContext;
 use crate::queue::{FlushBatch, FormatPromptArgs};
 use crate::turn_executor::TurnOutcome;
@@ -21,6 +21,26 @@ use crate::turn_executor::TurnOutcome;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_PENDING_EVENTS: usize = 128;
 const RECONNECT_ATTEMPTS: usize = 120;
+
+// AGW-SHARED/1 is a same-UID Unix socket. Other targets still compile the
+// client, but every connect fails.
+#[cfg(unix)]
+type Stream = tokio::net::UnixStream;
+#[cfg(not(unix))]
+type Stream = tokio::io::DuplexStream;
+
+#[cfg(unix)]
+async fn connect(path: &Path) -> io::Result<Stream> {
+    Stream::connect(path).await
+}
+
+#[cfg(not(unix))]
+async fn connect(_path: &Path) -> io::Result<Stream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "AGW-SHARED/1 requires a Unix socket",
+    ))
+}
 
 pub(crate) fn submission_id(route: &str, batch: &FlushBatch) -> String {
     let mut hash = Sha256::new();
@@ -34,7 +54,7 @@ pub(crate) fn submission_id(route: &str, batch: &FlushBatch) -> String {
 }
 
 pub(crate) struct Connection {
-    stream: UnixStream,
+    stream: Stream,
     next_id: u64,
     pending: VecDeque<Value>,
 }
@@ -52,7 +72,7 @@ impl Connection {
                 "invalid shared route",
             ));
         }
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(path))
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), connect(path))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shared connect timed out"))??;
         stream.write_all(b"AGW-SHARED/1\n").await?;
@@ -144,7 +164,7 @@ impl Connection {
     }
 }
 
-async fn read_line(stream: &mut UnixStream, limit: usize) -> io::Result<Vec<u8>> {
+async fn read_line(stream: &mut Stream, limit: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         let byte = stream.read_u8().await?;
@@ -198,6 +218,23 @@ fn task_id(value: &Value) -> Option<&str> {
     value.get("task_id").and_then(Value::as_str)
 }
 
+/// The daemon refuses a submit whose declared policy differs from the route's.
+fn submit_op(
+    submission: &str,
+    session: Option<&str>,
+    prompt: &str,
+    policy: &SharedPolicy,
+) -> Value {
+    json!({
+        "op": "submit",
+        "submission_id": submission,
+        "session_id": session,
+        "prompt": prompt,
+        "permission_profile": policy.permission_profile,
+        "side_effect_class": policy.side_effect_class,
+    })
+}
+
 fn terminal(state: &str) -> Option<TurnOutcome> {
     match state {
         "completed" => Some(TurnOutcome::Completed {
@@ -238,10 +275,12 @@ fn text_chunk(frame: &Value) -> Option<&str> {
 
 /// Run one admitted Buzz batch. A missing submit acknowledgment is reconciled
 /// by lookup only; a completed task whose transient text was missed is unknown
-/// to Buzz and is never prompted or published again.
+/// to Buzz and is never prompted or published again. A batch the daemon
+/// provably never admitted ends `Failed`, never `UnknownOutcome`.
 pub(crate) async fn run(
     path: &Path,
     route: &str,
+    policy: &SharedPolicy,
     batch: &FlushBatch,
     ctx: &PromptContext,
     mut stop: watch::Receiver<bool>,
@@ -252,6 +291,11 @@ pub(crate) async fn run(
         Err(outcome) => return outcome,
     };
     let mut may_have_submitted = false;
+    // Set once a lookup proves no task holds this submission ID. From then
+    // on, only this loop's own submits could create one. Until then an
+    // earlier harness process may have submitted it.
+    let mut absent = false;
+    let mut busy = false;
     let mut known_task: Option<String> = None;
     let mut cursor = 0u64;
     let mut reply = String::new();
@@ -285,6 +329,7 @@ pub(crate) async fn run(
                 reason: format!("submission {submission} was not found after an uncertain submit; inspect gateway journal"),
             };
         } else {
+            absent = true;
             let session = match connection.request(json!({"op":"route_session"})).await {
                 Ok(Value::String(session)) => Some(session),
                 Ok(Value::Null) => None,
@@ -297,14 +342,15 @@ pub(crate) async fn run(
             };
             may_have_submitted = true;
             let accepted = match connection
-                .request(json!({
-                    "op":"submit", "submission_id":submission, "session_id":session, "prompt":prompt
-                }))
+                .request(submit_op(&submission, session.as_deref(), &prompt, policy))
                 .await
             {
                 Ok(accepted) => accepted,
+                // `busy` is decided after the duplicate lookup, so this
+                // submit was definitely not admitted. Wait for the agent.
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     may_have_submitted = false;
+                    busy = true;
                     attempts -= 1;
                     continue;
                 }
@@ -442,10 +488,28 @@ pub(crate) async fn run(
             };
         }
     }
-    TurnOutcome::UnknownOutcome {
-        reason: format!(
-            "shared gateway unavailable; reconcile submission {submission} before re-asking"
-        ),
+    exhausted(
+        &submission,
+        absent && !may_have_submitted && known_task.is_none(),
+        busy,
+    )
+}
+
+fn exhausted(submission: &str, not_admitted: bool, busy: bool) -> TurnOutcome {
+    if !not_admitted {
+        return TurnOutcome::UnknownOutcome {
+            reason: format!(
+                "shared gateway unavailable; reconcile submission {submission} before re-asking"
+            ),
+        };
+    }
+    let cause = if busy {
+        "the agent stayed busy with another turn"
+    } else {
+        "the shared gateway stopped answering"
+    };
+    TurnOutcome::Failed {
+        reason: format!("{cause}; this request was not submitted"),
     }
 }
 
@@ -512,5 +576,152 @@ async fn publish_reply(batch: &FlushBatch, ctx: &PromptContext, content: &str) -
         Err(_) => TurnOutcome::UnknownOutcome {
             reason: "Buzz reply publication timed out; inspect channel before re-asking".into(),
         },
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::queue::BatchEvent;
+    use crate::scope::SessionScope;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::UnixListener;
+
+    fn policy() -> SharedPolicy {
+        SharedPolicy {
+            permission_profile: "repository_read".into(),
+            side_effect_class: "external_effects".into(),
+        }
+    }
+
+    fn batch() -> FlushBatch {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::text_note("status?")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        FlushBatch {
+            channel_id,
+            scope: SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    /// A daemon that has no task for the submission and answers every
+    /// submit with `refusal`. Each submit it sees is sent to the receiver.
+    fn refusing_daemon(
+        refusal: &'static str,
+    ) -> (
+        std::path::PathBuf,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
+        let path = std::env::temp_dir().join(format!("buzz-agw-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let (seen, submits) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let (Ok(Some(_)), Ok(Some(_))) =
+                        (lines.next_line().await, lines.next_line().await)
+                    else {
+                        return;
+                    };
+                    write.write_all(b"OK\n").await.unwrap();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let frame = if request["op"] == "submit" {
+                            let _ = seen.send(request.clone());
+                            json!({"type":"refusal", "id":request["id"], "reason":refusal})
+                        } else {
+                            json!({"type":"reply", "id":request["id"], "result":null})
+                        };
+                        let mut bytes = serde_json::to_vec(&frame).unwrap();
+                        bytes.push(b'\n');
+                        if write.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (path, submits)
+    }
+
+    #[test]
+    fn submit_declares_route_policy() {
+        let op = submit_op("buzz-1", None, "hello", &policy());
+        assert_eq!(
+            op,
+            json!({
+                "op": "submit",
+                "submission_id": "buzz-1",
+                "session_id": null,
+                "prompt": "hello",
+                "permission_profile": "repository_read",
+                "side_effect_class": "external_effects",
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_proven_absent_submission_is_definitely_not_submitted() {
+        assert!(matches!(
+            exhausted("buzz-1", false, false),
+            TurnOutcome::UnknownOutcome { .. }
+        ));
+        assert!(matches!(
+            exhausted("buzz-1", true, true),
+            TurnOutcome::Failed { reason } if reason.contains("busy")
+        ));
+        assert!(matches!(
+            exhausted("buzz-1", true, false),
+            TurnOutcome::Failed { reason } if reason.contains("not submitted")
+        ));
+    }
+
+    #[tokio::test]
+    async fn busy_agent_until_deadline_is_not_submitted() {
+        let (path, mut submits) = refusing_daemon("busy");
+        let mut ctx = crate::pool::tests::make_prompt_context_no_owner();
+        ctx.max_turn_duration = Duration::from_millis(900);
+        let (_stop, receiver) = watch::channel(false);
+        let outcome = run(&path, "rt-test", &policy(), &batch(), &ctx, receiver).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(&outcome, TurnOutcome::Failed { reason } if reason.contains("busy")),
+            "{outcome:?}"
+        );
+        let first = submits
+            .try_recv()
+            .expect("at least one submit reached the daemon");
+        assert_eq!(first["permission_profile"], "repository_read");
+        assert_eq!(first["side_effect_class"], "external_effects");
+    }
+
+    #[tokio::test]
+    async fn policy_refusal_fails_without_resubmitting() {
+        let (path, mut submits) = refusing_daemon("policy_mismatch");
+        let ctx = crate::pool::tests::make_prompt_context_no_owner();
+        let (_stop, receiver) = watch::channel(false);
+        let outcome = run(&path, "rt-test", &policy(), &batch(), &ctx, receiver).await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(&outcome, TurnOutcome::Failed { reason } if reason.contains("policy_mismatch")),
+            "{outcome:?}"
+        );
+        assert!(submits.try_recv().is_ok());
+        assert!(
+            submits.try_recv().is_err(),
+            "a refused submit was sent again"
+        );
     }
 }

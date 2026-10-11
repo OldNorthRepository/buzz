@@ -127,7 +127,10 @@ pub struct GatewayExecutor {
 
 enum GatewayConnection {
     Legacy(ControlClient),
-    Shared(std::path::PathBuf),
+    Shared {
+        socket: std::path::PathBuf,
+        policy: crate::config::SharedPolicy,
+    },
 }
 
 fn explicit_route_for(
@@ -185,6 +188,9 @@ impl GatewayExecutor {
     ) -> Result<(Self, tokio::sync::mpsc::UnboundedReceiver<GatewayTurnDone>), GatewayExecutorError>
     {
         if config.shared {
+            let policy = config.shared_policy.clone().ok_or_else(|| {
+                GatewayExecutorError::Shared("backend=shared has no declared route policy".into())
+            })?;
             let mut connection =
                 crate::shared_gateway::Connection::open(&config.socket, &config.route_id)
                     .await
@@ -196,7 +202,10 @@ impl GatewayExecutor {
             let (notify, done_rx) = tokio::sync::mpsc::unbounded_channel();
             return Ok((
                 Self {
-                    client: GatewayConnection::Shared(config.socket),
+                    client: GatewayConnection::Shared {
+                        socket: config.socket,
+                        policy,
+                    },
                     agent_id: String::new(),
                     route_id: config.route_id,
                     channel_routes: HashMap::new(),
@@ -391,7 +400,7 @@ impl GatewayExecutor {
         ctx: std::sync::Arc<PromptContext>,
     ) -> String {
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let shared_receiver = if matches!(self.client, GatewayConnection::Shared(_)) {
+        let shared_receiver = if matches!(self.client, GatewayConnection::Shared { .. }) {
             let (stop, receiver) = tokio::sync::watch::channel(false);
             if let Ok(mut stops) = self.shared_stops.lock() {
                 stops.insert(turn_id.clone(), stop);
@@ -409,12 +418,13 @@ impl GatewayExecutor {
             let channel_id = batch.channel_id;
             let scope = batch.scope.clone();
             let outcome = match &executor.client {
-                GatewayConnection::Shared(path) => {
+                GatewayConnection::Shared { socket, policy } => {
                     let outcome = match shared_receiver {
                         Some(receiver) => {
                             crate::shared_gateway::run(
-                                path,
+                                socket,
                                 &executor.route_id,
+                                policy,
                                 &batch,
                                 &ctx,
                                 receiver,
@@ -603,7 +613,7 @@ impl TurnExecutor for GatewayExecutor {
     }
 
     async fn cancel_turn(&self, turn_id: &str) -> bool {
-        if let GatewayConnection::Shared(_) = &self.client {
+        if let GatewayConnection::Shared { .. } = &self.client {
             return self
                 .shared_stops
                 .lock()
