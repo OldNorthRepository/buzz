@@ -384,6 +384,7 @@ mod inbound_author_gate {
         if is_dm {
             return match respond_to {
                 RespondTo::Nobody => false,
+                RespondTo::OwnerStrict => owner_cache.get() == Some(author),
                 _ => is_owner_or_sibling(author, owner_cache, rest_client).await,
             };
         }
@@ -391,6 +392,11 @@ mod inbound_author_gate {
             RespondTo::Anyone => true,
             RespondTo::Nobody => false,
             RespondTo::OwnerOnly => is_owner_or_sibling(author, owner_cache, rest_client).await,
+            // Siblings are any agent carrying an attestation from the same
+            // owner, so one compromised sibling could hand work to another.
+            // Strict mode admits the owner alone; an unresolved owner admits
+            // nobody.
+            RespondTo::OwnerStrict => owner_cache.get() == Some(author),
             RespondTo::Allowlist => {
                 allowlist.contains(author)
                     || is_owner_or_sibling(author, owner_cache, rest_client).await
@@ -507,8 +513,15 @@ mod inbound_author_gate {
             owner_cache: &OwnerCache,
             rest_client: &relay::RestClient,
         ) -> InboundAuthorGateDecision {
-            let effective_author =
-                effective_prompt_author(event, self.relay_self.as_deref(), &self.agent_pubkey_hex);
+            // Workflow attribution names the workflow's owner, but a trigger
+            // can carry another author's text into its message. Strict mode
+            // trusts only the raw signer, so an owner workflow cannot launder
+            // a sibling's post into an owner turn.
+            let effective_author = if matches!(respond_to, RespondTo::OwnerStrict) {
+                event.pubkey.to_hex()
+            } else {
+                effective_prompt_author(event, self.relay_self.as_deref(), &self.agent_pubkey_hex)
+            };
             let allowed = author_allowed(
                 respond_to,
                 allowlist,
@@ -2652,10 +2665,11 @@ async fn tokio_main() -> Result<()> {
     // Warn if owner-dependent mode but no owner resolved yet.
     if startup_owner.is_none() {
         match &config.respond_to {
-            RespondTo::OwnerOnly => {
+            RespondTo::OwnerOnly | RespondTo::OwnerStrict => {
                 tracing::warn!(
-                    "respond-to=owner-only but no owner is set — all events will be \
-                     dropped. Set BUZZ_AUTH_TAG or --agent-owner, or use --respond-to=anyone."
+                    "respond-to={} but no owner is set — all events will be \
+                     dropped. Set BUZZ_AUTH_TAG or --agent-owner, or use --respond-to=anyone.",
+                    config.respond_to
                 );
             }
             RespondTo::Allowlist => {
@@ -7202,6 +7216,38 @@ mod author_gate_tests {
         }
     }
 
+    /// Strict mode must not trust workflow attribution: a message-triggered
+    /// owner workflow could carry a sibling's text. Both production listeners
+    /// must drop a genuine relay-signed dispatch that names the owner.
+    #[tokio::test]
+    async fn production_listener_boundaries_ignore_workflow_owner_under_owner_strict() {
+        for listener in [ListenerBoundary::Normal, ListenerBoundary::Setup] {
+            let relay_keys = nostr::Keys::generate();
+            let relay_hex = relay_keys.public_key().to_hex();
+            let owner = nostr::Keys::generate().public_key().to_hex();
+            let (attributed, allowed) = listener_boundary_scenario(ListenerBoundaryScenario {
+                listener,
+                relay_keys: &relay_keys,
+                workflow_owner: &owner,
+                responses: std::collections::VecDeque::from([Ok(
+                    serde_json::json!({ "self": relay_hex }),
+                )]),
+                event_generation: 0,
+                channel_type: "stream",
+                respond_to: RespondTo::OwnerStrict,
+                allowlist: HashSet::new(),
+                cache_owner: true,
+                cache_sibling: false,
+            })
+            .await;
+            assert!(
+                !allowed && attributed.is_none(),
+                "{} listener must drop an owner-attributed workflow under owner-strict",
+                listener.name()
+            );
+        }
+    }
+
     /// Both production listener callables must attribute relay-signed workflow
     /// events to the workflow owner and enforce policy there. A local
     /// `allowed: true` replacement at either call site makes the Nobody case
@@ -8067,6 +8113,62 @@ mod author_gate_tests {
                 )
                 .await,
                 "under default OwnerOnly, the {label} must be admitted so steering can fire"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_owner_strict_admits_only_the_owner() {
+        let cache = cache_with_sibling();
+        for is_dm in [false, true] {
+            assert!(
+                inbound_author_gate::test_author_allowed(
+                    &RespondTo::OwnerStrict,
+                    &HashSet::new(),
+                    OWNER,
+                    is_dm,
+                    &cache,
+                    &dummy_rest_client()
+                )
+                .await,
+                "owner-strict must admit the owner (dm={is_dm})"
+            );
+            for (who, label) in [
+                (SIBLING, "sibling"),
+                (STRANGER, "stranger"),
+                (EXTERNAL, "external"),
+            ] {
+                assert!(
+                    !inbound_author_gate::test_author_allowed(
+                        &RespondTo::OwnerStrict,
+                        &HashSet::from([EXTERNAL.to_string()]),
+                        who,
+                        is_dm,
+                        &cache,
+                        &dummy_rest_client()
+                    )
+                    .await,
+                    "owner-strict must drop the {label} (dm={is_dm})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_owner_strict_without_owner_admits_nobody() {
+        let cache = OwnerCache::new(None);
+        for is_dm in [false, true] {
+            assert!(
+                !inbound_author_gate::test_author_allowed(
+                    &RespondTo::OwnerStrict,
+                    &HashSet::new(),
+                    OWNER,
+                    is_dm,
+                    &cache,
+                    &dummy_rest_client()
+                )
+                .await,
+                "an unresolved owner must fail closed (dm={is_dm})"
             );
         }
     }

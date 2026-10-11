@@ -314,7 +314,9 @@ pub enum MultipleEventHandling {
 
 /// Inbound author gate: which authors' events the harness forwards to the agent.
 ///
-/// - `owner-only` — only the agent's registered owner (default).
+/// - `owner-only` — the agent's registered owner and its sibling agents (default).
+/// - `owner-strict` — the owner alone, as raw signer, in channels and DMs; never
+///   siblings or owner-attributed workflow messages.
 /// - `allowlist`  — owner + explicit pubkey list (`--respond-to-allowlist`).
 /// - `anyone`     — all events forwarded (no author filtering).
 /// - `nobody`     — all events dropped (proactive/heartbeat-only mode).
@@ -322,6 +324,7 @@ pub enum MultipleEventHandling {
 pub enum RespondTo {
     #[default]
     OwnerOnly,
+    OwnerStrict,
     Allowlist,
     Anyone,
     Nobody,
@@ -331,6 +334,7 @@ impl std::fmt::Display for RespondTo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OwnerOnly => f.write_str("owner-only"),
+            Self::OwnerStrict => f.write_str("owner-strict"),
             Self::Allowlist => f.write_str("allowlist"),
             Self::Anyone => f.write_str("anyone"),
             Self::Nobody => f.write_str("nobody"),
@@ -489,7 +493,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub gwp_worker: bool,
 
-    /// Agent owner pubkey (64-char hex). Used for --respond-to=owner-only gate.
+    /// Agent owner pubkey (64-char hex). Used by the owner-only and owner-strict gates.
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
     pub agent_owner: Option<String>,
 
@@ -726,7 +730,7 @@ pub struct CliArgs {
     pub permission_mode: PermissionMode,
 
     /// Inbound author gate: which authors' events the harness forwards.
-    /// Modes: owner-only (default), allowlist, anyone, nobody.
+    /// Modes: owner-only (default), owner-strict, allowlist, anyone, nobody.
     #[arg(
         long,
         env = "BUZZ_ACP_RESPOND_TO",
@@ -1478,7 +1482,7 @@ impl Config {
                 RespondTo::from_str(s.trim(), true).map_err(|_| {
                     ConfigError::ConfigFile(format!(
                         "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                         (valid values: owner-only, allowlist, anyone, nobody)"
+                         (valid values: owner-only, owner-strict, allowlist, anyone, nobody)"
                     ))
                 })?;
             }
@@ -3154,6 +3158,7 @@ channels = "ALL"
     #[test]
     fn test_respond_to_display() {
         assert_eq!(format!("{}", RespondTo::OwnerOnly), "owner-only");
+        assert_eq!(format!("{}", RespondTo::OwnerStrict), "owner-strict");
         assert_eq!(format!("{}", RespondTo::Allowlist), "allowlist");
         assert_eq!(format!("{}", RespondTo::Anyone), "anyone");
         assert_eq!(format!("{}", RespondTo::Nobody), "nobody");
@@ -3165,6 +3170,10 @@ channels = "ALL"
         assert_eq!(
             RespondTo::from_str("owner-only", true).unwrap(),
             RespondTo::OwnerOnly
+        );
+        assert_eq!(
+            RespondTo::from_str("owner-strict", true).unwrap(),
+            RespondTo::OwnerStrict
         );
         assert_eq!(
             RespondTo::from_str("allowlist", true).unwrap(),
@@ -3435,7 +3444,7 @@ channels = "ALL"
             let mode = RespondTo::from_str(s.trim(), true).map_err(|_| {
                 ConfigError::ConfigFile(format!(
                     "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
-                     (valid values: owner-only, allowlist, anyone, nobody)"
+                     (valid values: owner-only, owner-strict, allowlist, anyone, nobody)"
                 ))
             })?;
             set.insert(mode);
