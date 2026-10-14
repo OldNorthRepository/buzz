@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::sync::watch;
 
 use crate::config::SharedPolicy;
@@ -56,9 +56,11 @@ pub(crate) fn submission_id(route: &str, batch: &FlushBatch) -> String {
 }
 
 pub(crate) struct Connection {
-    stream: Stream,
+    stream: BufStream<Stream>,
     next_id: u64,
     pending: VecDeque<Value>,
+    /// The bytes of a frame whose read was cancelled before its newline.
+    partial: Vec<u8>,
 }
 
 impl Connection {
@@ -74,15 +76,21 @@ impl Connection {
                 "invalid shared route",
             ));
         }
-        let mut stream = tokio::time::timeout(Duration::from_secs(5), connect(path))
+        let stream = tokio::time::timeout(Duration::from_secs(5), connect(path))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shared connect timed out"))??;
+        let mut stream = BufStream::new(stream);
         stream.write_all(b"AGW-SHARED/1\n").await?;
         stream.write_all(route.as_bytes()).await?;
         stream.write_all(b"\n").await?;
-        let answer = tokio::time::timeout(Duration::from_secs(5), read_line(&mut stream, 128))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shared admission timed out"))??;
+        stream.flush().await?;
+        let mut answer = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            read_line(&mut stream, &mut answer, 128),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shared admission timed out"))??;
         if answer != b"OK" {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -93,6 +101,7 @@ impl Connection {
             stream,
             next_id: 0,
             pending: VecDeque::new(),
+            partial: Vec::new(),
         })
     }
 
@@ -115,6 +124,7 @@ impl Connection {
         }
         self.stream.write_all(&bytes).await?;
         self.stream.write_all(b"\n").await?;
+        self.stream.flush().await?;
         loop {
             let frame = tokio::time::timeout(Duration::from_secs(10), self.read())
                 .await
@@ -160,26 +170,35 @@ impl Connection {
         }
     }
 
+    /// Cancel-safe, so `run` can `select!` over it: an unfinished frame
+    /// stays in `partial` for the next call.
     async fn read(&mut self) -> io::Result<Value> {
-        let line = read_line(&mut self.stream, MAX_FRAME).await?;
+        read_line(&mut self.stream, &mut self.partial, MAX_FRAME).await?;
+        let line = std::mem::take(&mut self.partial);
         serde_json::from_slice(&line).map_err(io::Error::other)
     }
 }
 
-async fn read_line(stream: &mut Stream, limit: usize) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+/// Append bytes to `line` up to the next newline, which is not kept.
+/// `read_u8` takes one byte or none, so cancelling this loses nothing that
+/// `line` does not hold.
+async fn read_line(
+    stream: &mut BufStream<Stream>,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<()> {
     loop {
         let byte = stream.read_u8().await?;
         if byte == b'\n' {
-            return Ok(bytes);
+            return Ok(());
         }
-        if bytes.len() == limit {
+        if line.len() == limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "shared frame too large",
             ));
         }
-        bytes.push(byte);
+        line.push(byte);
     }
 }
 
@@ -277,10 +296,11 @@ fn text_chunk(frame: &Value) -> Option<&str> {
 
 /// Run one admitted Buzz batch. A missing submit acknowledgment is reconciled
 /// by lookup only. Text missed while the task ran is read back from the
-/// daemon's retained replay once it finishes; a completed task whose text is
-/// gone from that replay too is unknown to Buzz and is never prompted or
-/// published again. A batch the daemon provably never admitted ends `Failed`,
-/// never `UnknownOutcome`.
+/// daemon's retained replay once it finishes. The daemon bounds that replay
+/// per task and in total and drops a task's events past either bound, so a
+/// completed task whose text is gone from it too is unknown to Buzz and is
+/// never prompted or published again. A batch the daemon provably never
+/// admitted ends `Failed`, never `UnknownOutcome`.
 pub(crate) async fn run(
     path: &Path,
     route: &str,
@@ -385,6 +405,10 @@ pub(crate) async fn run(
             Err(_) => continue,
         };
         let mut already_terminal = terminal(&state).is_some();
+        // Attaching after the task finished yields the daemon's retained
+        // replay, where a gap cannot be recovered. Read this before reclaim,
+        // which may see the task finish while this attachment is still live.
+        let replaying = already_terminal;
         if connection
             .request(json!({"op":"attach", "task_id":task, "after_sequence":cursor}))
             .await
@@ -420,11 +444,8 @@ pub(crate) async fn run(
             continue;
         }
         let mut saw_gap = false;
-        // Attached after the task finished, so this is the daemon's retained
-        // replay. A gap in it cannot be recovered.
-        let replaying = already_terminal;
         // Set once live events were lost: when to poll the task's state if
-        // no frame arrives first. The daemon keeps every event of a finished
+        // no frame arrives first. The daemon keeps the events of a finished
         // task, so wait for the terminal state, then reconnect and replay
         // from `cursor`.
         let mut resync: Option<tokio::time::Instant> = None;
@@ -440,9 +461,11 @@ pub(crate) async fn run(
                         break;
                     }
                 }
-                // The same lag can drop the terminal frame, so poll once the
-                // stream goes quiet. Polling during a burst would queue the
-                // reply behind its events.
+                // A lagged stream still ends with the terminal frame, but a
+                // gap with no live updates behind it (the task finished
+                // between the state read and attach) is followed by nothing.
+                // Poll once the stream goes quiet; polling during a burst
+                // would queue the reply behind its events.
                 _ = tokio::time::sleep_until(resync.unwrap_or(deadline)), if resync.is_some() => {
                     match task_state(&mut connection, &task).await {
                         Ok(state) if terminal(&state).is_none() => {
@@ -504,7 +527,7 @@ pub(crate) async fn run(
                                     Err(error) => return TurnOutcome::UnknownOutcome { reason: format!("terminal state unavailable: {error}") },
                                 };
                                 let outcome = terminal(&state).unwrap_or(TurnOutcome::UnknownOutcome { reason: "terminal frame without terminal state".into() });
-                                if matches!(outcome, TurnOutcome::Completed { .. }) && !saw_gap {
+                                if matches!(outcome, TurnOutcome::Completed { .. }) {
                                     return publish_reply(batch, ctx, &reply).await;
                                 }
                                 return outcome;
@@ -671,38 +694,15 @@ mod tests {
         std::path::PathBuf,
         tokio::sync::mpsc::UnboundedReceiver<Value>,
     ) {
-        let path = std::env::temp_dir().join(format!("buzz-agw-{}.sock", uuid::Uuid::new_v4()));
-        let listener = UnixListener::bind(&path).unwrap();
         let (seen, submits) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let seen = seen.clone();
-                tokio::spawn(async move {
-                    let (read, mut write) = stream.into_split();
-                    let mut lines = BufReader::new(read).lines();
-                    let (Ok(Some(_)), Ok(Some(_))) =
-                        (lines.next_line().await, lines.next_line().await)
-                    else {
-                        return;
-                    };
-                    write.write_all(b"OK\n").await.unwrap();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        let request: Value = serde_json::from_str(&line).unwrap();
-                        let frame = if request["op"] == "submit" {
-                            let _ = seen.send(request.clone());
-                            json!({"type":"refusal", "id":request["id"], "reason":refusal})
-                        } else {
-                            json!({"type":"reply", "id":request["id"], "result":null})
-                        };
-                        let mut bytes = serde_json::to_vec(&frame).unwrap();
-                        bytes.push(b'\n');
-                        if write.write_all(&bytes).await.is_err() {
-                            return;
-                        }
-                    }
-                });
+        let path = scripted_daemon(Arc::new(move |_, request: &Value| {
+            if request["op"] == "submit" {
+                let _ = seen.send(request.clone());
+                vec![json!({"type":"refusal", "id":request["id"], "reason":refusal})]
+            } else {
+                vec![reply(request, Value::Null)]
             }
-        });
+        }));
         (path, submits)
     }
 
@@ -792,7 +792,8 @@ mod tests {
     type Script = Arc<dyn Fn(usize, &Value) -> Vec<Value> + Send + Sync>;
 
     /// A daemon that answers each request on its `n`th connection, counting
-    /// from 0, with the frames `script(n, request)` returns, in order.
+    /// from 0, with the frames `script(n, request)` returns, in order. A
+    /// `hang_up()` frame closes that connection instead.
     fn scripted_daemon(script: Script) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("buzz-agw-{}.sock", uuid::Uuid::new_v4()));
         let listener = UnixListener::bind(&path).unwrap();
@@ -813,6 +814,9 @@ mod tests {
                     while let Ok(Some(line)) = lines.next_line().await {
                         let request: Value = serde_json::from_str(&line).unwrap();
                         for frame in script(n, &request) {
+                            if frame == hang_up() {
+                                return;
+                            }
                             let mut bytes = serde_json::to_vec(&frame).unwrap();
                             bytes.push(b'\n');
                             if write.write_all(&bytes).await.is_err() {
@@ -844,11 +848,17 @@ mod tests {
         json!({"type":"event", "task_id":"t1", "sequence":sequence, "kind":"terminal", "payload":null})
     }
 
+    fn hang_up() -> Value {
+        json!({"hang_up": true})
+    }
+
     /// The daemon side of one task, `t1`. The first connection submits it,
-    /// sees it running once and finished after that, and gets `live` after
-    /// its attach. Every later connection finds it finished and gets
-    /// `retained`. Each attach's `after_sequence` goes to the receiver.
+    /// sees it running for its first `running_reads` state reads and
+    /// finished after that, and gets `live` after its attach. Every later
+    /// connection finds it finished and gets `retained`. Each attach's
+    /// `after_sequence` goes to the receiver.
     fn gap_daemon(
+        running_reads: usize,
         live: Vec<Value>,
         retained: Vec<Value>,
     ) -> (
@@ -864,7 +874,7 @@ mod tests {
                 "submission" => json!({"task_id":"t1"}),
                 "route_session" => Value::Null,
                 "submit" => json!({"task":{"task_id":"t1"}, "admission":"accepted"}),
-                "task" if first && reads.fetch_add(1, Ordering::SeqCst) == 0 => {
+                "task" if first && reads.fetch_add(1, Ordering::SeqCst) < running_reads => {
                     json!({"state":"running"})
                 }
                 "task" => json!({"state":"completed"}),
@@ -954,7 +964,7 @@ mod tests {
             vec![chunk(1, "Hello "), gap(), chunk(4, "!"), finished(5)],
             vec![chunk(1, "Hello "), chunk(4, "!"), finished(5)],
         ] {
-            let (path, mut attaches) = gap_daemon(live, retained_after_one());
+            let (path, mut attaches) = gap_daemon(1, live, retained_after_one());
             let (outcome, mut published) = run_publishing(&path).await;
             assert!(
                 matches!(&outcome, TurnOutcome::Completed { summary } if summary == "shared reply published"),
@@ -975,9 +985,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_terminal_frame_lost_to_the_gap_is_found_by_polling() {
+    async fn a_gap_with_nothing_behind_it_is_resolved_by_polling() {
+        // The first poll still sees the task running, the second sees it
+        // finished.
         let (path, mut attaches) =
-            gap_daemon(vec![chunk(1, "Hello "), gap()], retained_after_one());
+            gap_daemon(2, vec![chunk(1, "Hello "), gap()], retained_after_one());
         let (outcome, mut published) = run_publishing(&path).await;
         assert!(
             matches!(&outcome, TurnOutcome::Completed { summary } if summary == "shared reply published"),
@@ -991,7 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn a_gap_in_the_retained_replay_is_final() {
         let (path, mut attaches) =
-            gap_daemon(vec![chunk(1, "Hello "), gap(), finished(5)], vec![gap()]);
+            gap_daemon(1, vec![chunk(1, "Hello "), gap(), finished(5)], vec![gap()]);
         let (outcome, mut published) = run_publishing(&path).await;
         assert!(
             matches!(&outcome, TurnOutcome::UnknownOutcome { reason } if reason.contains("shared stream gap")),
@@ -1004,5 +1016,71 @@ mod tests {
         assert_eq!(attaches.try_recv().unwrap(), 0);
         assert_eq!(attaches.try_recv().unwrap(), 1);
         assert!(attaches.try_recv().is_err(), "a final gap was retried");
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_stays_recoverable_when_reclaim_sees_the_task_finish() {
+        // The first connection drops mid-turn. The second reattaches to the
+        // running task, but its window has moved past `cursor`, and the task
+        // finishes before reclaim. That gap is live, not retained.
+        let (attached, mut attaches) = tokio::sync::mpsc::unbounded_channel();
+        let second_reads = AtomicUsize::new(0);
+        let script = move |connection: usize, request: &Value| {
+            let result = match (connection, request["op"].as_str().unwrap_or_default()) {
+                (0, "submission") | (_, "route_session") => Value::Null,
+                (_, "submission") => json!({"task_id":"t1"}),
+                (_, "submit") => json!({"task":{"task_id":"t1"}, "admission":"accepted"}),
+                (0, "task") => json!({"state":"running"}),
+                (1, "task") if second_reads.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    json!({"state":"running"})
+                }
+                (_, "task") => json!({"state":"completed"}),
+                (_, "reclaim") => json!({"claimed":false}),
+                (_, "attach") => {
+                    let _ = attached.send(request["after_sequence"].as_u64().unwrap());
+                    let mut frames = vec![reply(request, json!({}))];
+                    frames.extend(match connection {
+                        0 => vec![chunk(1, "Hello "), hang_up()],
+                        1 => vec![
+                            json!({"type":"gap", "task_id":"t1", "first_available":3}),
+                            finished(5),
+                        ],
+                        _ => retained_after_one(),
+                    });
+                    return frames;
+                }
+                _ => Value::Null,
+            };
+            vec![reply(request, result)]
+        };
+        let path = scripted_daemon(Arc::new(script));
+        let (outcome, mut published) = run_publishing(&path).await;
+        assert!(
+            matches!(&outcome, TurnOutcome::Completed { summary } if summary == "shared reply published"),
+            "{outcome:?}"
+        );
+        assert_eq!(published.try_recv().unwrap(), "Hello world!");
+        for expected in [0, 1, 1] {
+            assert_eq!(attaches.try_recv().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_cancelled_mid_frame_keeps_its_bytes() {
+        let (client, mut daemon) = tokio::net::UnixStream::pair().unwrap();
+        let mut connection = Connection {
+            stream: BufStream::new(client),
+            next_id: 0,
+            pending: VecDeque::new(),
+            partial: Vec::new(),
+        };
+        daemon.write_all(br#"{"type":"gap","#).await.unwrap();
+        let cut = tokio::time::timeout(Duration::from_millis(100), connection.next_event()).await;
+        assert!(cut.is_err(), "half a frame was returned: {cut:?}");
+        daemon.write_all(b"\"task_id\":\"t1\"}\n").await.unwrap();
+        assert_eq!(
+            connection.next_event().await.unwrap(),
+            json!({"type":"gap", "task_id":"t1"})
+        );
     }
 }
