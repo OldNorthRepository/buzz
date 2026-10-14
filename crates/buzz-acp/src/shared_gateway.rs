@@ -856,7 +856,8 @@ mod tests {
     /// sees it running for its first `running_reads` state reads and
     /// finished after that, and gets `live` after its attach. Every later
     /// connection finds it finished and gets `retained`. Each attach's
-    /// `after_sequence` goes to the receiver.
+    /// `after_sequence` goes to the receiver; the counter is the first
+    /// connection's state reads.
     fn gap_daemon(
         running_reads: usize,
         live: Vec<Value>,
@@ -864,9 +865,11 @@ mod tests {
     ) -> (
         std::path::PathBuf,
         tokio::sync::mpsc::UnboundedReceiver<u64>,
+        Arc<AtomicUsize>,
     ) {
         let (attached, attaches) = tokio::sync::mpsc::unbounded_channel();
-        let reads = AtomicUsize::new(0);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
         let script = move |connection: usize, request: &Value| {
             let first = connection == 0;
             let result = match request["op"].as_str().unwrap_or_default() {
@@ -874,7 +877,7 @@ mod tests {
                 "submission" => json!({"task_id":"t1"}),
                 "route_session" => Value::Null,
                 "submit" => json!({"task":{"task_id":"t1"}, "admission":"accepted"}),
-                "task" if first && reads.fetch_add(1, Ordering::SeqCst) < running_reads => {
+                "task" if first && counted.fetch_add(1, Ordering::SeqCst) < running_reads => {
                     json!({"state":"running"})
                 }
                 "task" => json!({"state":"completed"}),
@@ -888,7 +891,7 @@ mod tests {
             };
             vec![reply(request, result)]
         };
-        (scripted_daemon(Arc::new(script)), attaches)
+        (scripted_daemon(Arc::new(script)), attaches, reads)
     }
 
     /// A relay that accepts every `POST /events` and sends the event's
@@ -964,7 +967,7 @@ mod tests {
             vec![chunk(1, "Hello "), gap(), chunk(4, "!"), finished(5)],
             vec![chunk(1, "Hello "), chunk(4, "!"), finished(5)],
         ] {
-            let (path, mut attaches) = gap_daemon(1, live, retained_after_one());
+            let (path, mut attaches, _) = gap_daemon(1, live, retained_after_one());
             let (outcome, mut published) = run_publishing(&path).await;
             assert!(
                 matches!(&outcome, TurnOutcome::Completed { summary } if summary == "shared reply published"),
@@ -988,7 +991,7 @@ mod tests {
     async fn a_gap_with_nothing_behind_it_is_resolved_by_polling() {
         // The first poll still sees the task running, the second sees it
         // finished.
-        let (path, mut attaches) =
+        let (path, mut attaches, reads) =
             gap_daemon(2, vec![chunk(1, "Hello "), gap()], retained_after_one());
         let (outcome, mut published) = run_publishing(&path).await;
         assert!(
@@ -996,13 +999,26 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(published.try_recv().unwrap(), "Hello world!");
+        assert!(
+            published.try_recv().is_err(),
+            "the reply was published twice"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "a running poll must re-arm on the same connection"
+        );
         assert_eq!(attaches.try_recv().unwrap(), 0);
         assert_eq!(attaches.try_recv().unwrap(), 1);
+        assert!(
+            attaches.try_recv().is_err(),
+            "attached again after publishing"
+        );
     }
 
     #[tokio::test]
     async fn a_gap_in_the_retained_replay_is_final() {
-        let (path, mut attaches) =
+        let (path, mut attaches, _) =
             gap_daemon(1, vec![chunk(1, "Hello "), gap(), finished(5)], vec![gap()]);
         let (outcome, mut published) = run_publishing(&path).await;
         assert!(
@@ -1060,9 +1076,17 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(published.try_recv().unwrap(), "Hello world!");
+        assert!(
+            published.try_recv().is_err(),
+            "the reply was published twice"
+        );
         for expected in [0, 1, 1] {
             assert_eq!(attaches.try_recv().unwrap(), expected);
         }
+        assert!(
+            attaches.try_recv().is_err(),
+            "attached again after publishing"
+        );
     }
 
     #[tokio::test]
