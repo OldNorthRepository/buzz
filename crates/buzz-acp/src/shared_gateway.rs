@@ -21,6 +21,8 @@ use crate::turn_executor::TurnOutcome;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_PENDING_EVENTS: usize = 128;
 const RECONNECT_ATTEMPTS: usize = 120;
+/// How often to check whether a task that lost live events has finished.
+const RESYNC_POLL: Duration = Duration::from_secs(1);
 
 // AGW-SHARED/1 is a same-UID Unix socket. Other targets still compile the
 // client, but every connect fails.
@@ -274,9 +276,11 @@ fn text_chunk(frame: &Value) -> Option<&str> {
 }
 
 /// Run one admitted Buzz batch. A missing submit acknowledgment is reconciled
-/// by lookup only; a completed task whose transient text was missed is unknown
-/// to Buzz and is never prompted or published again. A batch the daemon
-/// provably never admitted ends `Failed`, never `UnknownOutcome`.
+/// by lookup only. Text missed while the task ran is read back from the
+/// daemon's retained replay once it finishes; a completed task whose text is
+/// gone from that replay too is unknown to Buzz and is never prompted or
+/// published again. A batch the daemon provably never admitted ends `Failed`,
+/// never `UnknownOutcome`.
 pub(crate) async fn run(
     path: &Path,
     route: &str,
@@ -416,6 +420,14 @@ pub(crate) async fn run(
             continue;
         }
         let mut saw_gap = false;
+        // Attached after the task finished, so this is the daemon's retained
+        // replay. A gap in it cannot be recovered.
+        let replaying = already_terminal;
+        // Set once live events were lost: when to poll the task's state if
+        // no frame arrives first. The daemon keeps every event of a finished
+        // task, so wait for the terminal state, then reconnect and replay
+        // from `cursor`.
+        let mut resync: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
@@ -428,20 +440,38 @@ pub(crate) async fn run(
                         break;
                     }
                 }
+                // The same lag can drop the terminal frame, so poll once the
+                // stream goes quiet. Polling during a burst would queue the
+                // reply behind its events.
+                _ = tokio::time::sleep_until(resync.unwrap_or(deadline)), if resync.is_some() => {
+                    match task_state(&mut connection, &task).await {
+                        Ok(state) if terminal(&state).is_none() => {
+                            resync = Some(tokio::time::Instant::now() + RESYNC_POLL);
+                        }
+                        _ => break,
+                    }
+                }
                 frame = connection.next_event() => {
                     let frame = match frame { Ok(frame) => frame, Err(_) => break };
                     match frame.get("type").and_then(Value::as_str) {
-                        Some("gap") => { saw_gap = true; break; }
+                        Some("gap") if replaying => { saw_gap = true; break; }
+                        Some("gap") => resync = Some(tokio::time::Instant::now() + RESYNC_POLL),
                         Some("event") if frame["task_id"] == task => {
                             let sequence = frame["sequence"].as_u64().unwrap_or(0);
-                            if sequence != cursor + 1 { saw_gap = true; break; }
-                            cursor = sequence;
-                            if let Some(chunk) = text_chunk(&frame) {
-                                if reply.len().saturating_add(chunk.len()) > MAX_FRAME {
-                                    saw_gap = true;
-                                    break;
+                            if resync.is_some() || sequence != cursor + 1 {
+                                if replaying { saw_gap = true; break; }
+                                // Text after a gap would land out of order.
+                                // The replay from `cursor` delivers it instead.
+                                resync = Some(tokio::time::Instant::now() + RESYNC_POLL);
+                            } else {
+                                cursor = sequence;
+                                if let Some(chunk) = text_chunk(&frame) {
+                                    if reply.len().saturating_add(chunk.len()) > MAX_FRAME {
+                                        saw_gap = true;
+                                        break;
+                                    }
+                                    reply.push_str(chunk);
                                 }
-                                reply.push_str(chunk);
                             }
                             if frame["kind"] == "reverse_request" && !already_terminal {
                                 if let Some(request_id) = frame["request_id"].as_str() {
@@ -466,6 +496,9 @@ pub(crate) async fn run(
                                 }
                             }
                             if frame["kind"] == "terminal" {
+                                if resync.is_some() {
+                                    break;
+                                }
                                 let state = match task_state(&mut connection, &task).await {
                                     Ok(state) => state,
                                     Err(error) => return TurnOutcome::UnknownOutcome { reason: format!("terminal state unavailable: {error}") },
@@ -599,6 +632,8 @@ mod tests {
     use super::*;
     use crate::queue::BatchEvent;
     use crate::scope::SessionScope;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -752,5 +787,222 @@ mod tests {
             submits.try_recv().is_err(),
             "a refused submit was sent again"
         );
+    }
+
+    type Script = Arc<dyn Fn(usize, &Value) -> Vec<Value> + Send + Sync>;
+
+    /// A daemon that answers each request on its `n`th connection, counting
+    /// from 0, with the frames `script(n, request)` returns, in order.
+    fn scripted_daemon(script: Script) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("buzz-agw-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let mut connections = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                let (n, script) = (connections, script.clone());
+                connections += 1;
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let (Ok(Some(_)), Ok(Some(_))) =
+                        (lines.next_line().await, lines.next_line().await)
+                    else {
+                        return;
+                    };
+                    write.write_all(b"OK\n").await.unwrap();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        for frame in script(n, &request) {
+                            let mut bytes = serde_json::to_vec(&frame).unwrap();
+                            bytes.push(b'\n');
+                            if write.write_all(&bytes).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        path
+    }
+
+    fn reply(request: &Value, result: Value) -> Value {
+        json!({"type":"reply", "id":request["id"], "result":result})
+    }
+
+    fn chunk(sequence: u64, text: &str) -> Value {
+        json!({"type":"event", "task_id":"t1", "sequence":sequence, "kind":"acp_update",
+            "payload":{"params":{"update":{"sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text", "text":text}}}}})
+    }
+
+    fn gap() -> Value {
+        json!({"type":"gap", "task_id":"t1", "first_available":null})
+    }
+
+    fn finished(sequence: u64) -> Value {
+        json!({"type":"event", "task_id":"t1", "sequence":sequence, "kind":"terminal", "payload":null})
+    }
+
+    /// The daemon side of one task, `t1`. The first connection submits it,
+    /// sees it running once and finished after that, and gets `live` after
+    /// its attach. Every later connection finds it finished and gets
+    /// `retained`. Each attach's `after_sequence` goes to the receiver.
+    fn gap_daemon(
+        live: Vec<Value>,
+        retained: Vec<Value>,
+    ) -> (
+        std::path::PathBuf,
+        tokio::sync::mpsc::UnboundedReceiver<u64>,
+    ) {
+        let (attached, attaches) = tokio::sync::mpsc::unbounded_channel();
+        let reads = AtomicUsize::new(0);
+        let script = move |connection: usize, request: &Value| {
+            let first = connection == 0;
+            let result = match request["op"].as_str().unwrap_or_default() {
+                "submission" if first => Value::Null,
+                "submission" => json!({"task_id":"t1"}),
+                "route_session" => Value::Null,
+                "submit" => json!({"task":{"task_id":"t1"}, "admission":"accepted"}),
+                "task" if first && reads.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    json!({"state":"running"})
+                }
+                "task" => json!({"state":"completed"}),
+                "attach" => {
+                    let _ = attached.send(request["after_sequence"].as_u64().unwrap());
+                    let mut frames = vec![reply(request, json!({}))];
+                    frames.extend(if first { &live } else { &retained }.iter().cloned());
+                    return frames;
+                }
+                _ => Value::Null,
+            };
+            vec![reply(request, result)]
+        };
+        (scripted_daemon(Arc::new(script)), attaches)
+    }
+
+    /// A relay that accepts every `POST /events` and sends the event's
+    /// content to the receiver.
+    async fn recording_relay() -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, published) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let mut body = None;
+                while body.is_none() {
+                    let n = socket.read(&mut buffer).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    body = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|at| at + 4);
+                }
+                let Some(body) = body else { continue };
+                let head = String::from_utf8_lossy(&request[..body]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < body + length {
+                    let n = socket.read(&mut buffer).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                if let Ok(event) = serde_json::from_slice::<Value>(&request[body..]) {
+                    let _ = seen.send(event["content"].as_str().unwrap_or_default().to_owned());
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+        (base_url, published)
+    }
+
+    async fn run_publishing(
+        path: &Path,
+    ) -> (TurnOutcome, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (base_url, published) = recording_relay().await;
+        let mut ctx = crate::pool::tests::make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base_url;
+        let (_stop, receiver) = watch::channel(false);
+        let outcome = run(path, "rt-test", &policy(), &batch(), &ctx, receiver).await;
+        let _ = std::fs::remove_file(path);
+        (outcome, published)
+    }
+
+    /// The retained replay of `t1` after the client's last contiguous event.
+    fn retained_after_one() -> Vec<Value> {
+        vec![chunk(2, "wor"), chunk(3, "ld"), chunk(4, "!"), finished(5)]
+    }
+
+    #[tokio::test]
+    async fn a_live_gap_is_replayed_from_the_retained_stream() {
+        // The daemon reports the lag, or the next sequence simply skips.
+        for live in [
+            vec![chunk(1, "Hello "), gap(), chunk(4, "!"), finished(5)],
+            vec![chunk(1, "Hello "), chunk(4, "!"), finished(5)],
+        ] {
+            let (path, mut attaches) = gap_daemon(live, retained_after_one());
+            let (outcome, mut published) = run_publishing(&path).await;
+            assert!(
+                matches!(&outcome, TurnOutcome::Completed { summary } if summary == "shared reply published"),
+                "{outcome:?}"
+            );
+            assert_eq!(published.try_recv().unwrap(), "Hello world!");
+            assert!(
+                published.try_recv().is_err(),
+                "the reply was published twice"
+            );
+            assert_eq!(attaches.try_recv().unwrap(), 0);
+            assert_eq!(
+                attaches.try_recv().unwrap(),
+                1,
+                "the replay must resume after the last contiguous event"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_frame_lost_to_the_gap_is_found_by_polling() {
+        let (path, mut attaches) =
+            gap_daemon(vec![chunk(1, "Hello "), gap()], retained_after_one());
+        let (outcome, mut published) = run_publishing(&path).await;
+        assert!(
+            matches!(&outcome, TurnOutcome::Completed { summary } if summary == "shared reply published"),
+            "{outcome:?}"
+        );
+        assert_eq!(published.try_recv().unwrap(), "Hello world!");
+        assert_eq!(attaches.try_recv().unwrap(), 0);
+        assert_eq!(attaches.try_recv().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_the_retained_replay_is_final() {
+        let (path, mut attaches) =
+            gap_daemon(vec![chunk(1, "Hello "), gap(), finished(5)], vec![gap()]);
+        let (outcome, mut published) = run_publishing(&path).await;
+        assert!(
+            matches!(&outcome, TurnOutcome::UnknownOutcome { reason } if reason.contains("shared stream gap")),
+            "{outcome:?}"
+        );
+        assert!(
+            published.try_recv().is_err(),
+            "a partial reply was published"
+        );
+        assert_eq!(attaches.try_recv().unwrap(), 0);
+        assert_eq!(attaches.try_recv().unwrap(), 1);
+        assert!(attaches.try_recv().is_err(), "a final gap was retried");
     }
 }
